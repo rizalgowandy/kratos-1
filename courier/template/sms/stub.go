@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package sms
 
 import (
@@ -15,9 +18,9 @@ type (
 	}
 
 	TestStubModel struct {
-		To       string
-		Body     string
-		Identity map[string]interface{}
+		To       string                 `json:"to"`
+		Body     string                 `json:"body"`
+		Identity map[string]interface{} `json:"identity"`
 	}
 )
 
@@ -30,9 +33,13 @@ func (t *TestStub) PhoneNumber() (string, error) {
 }
 
 func (t *TestStub) SMSBody(ctx context.Context) (string, error) {
-	return template.LoadText(ctx, t.d, os.DirFS(t.d.CourierConfig(ctx).CourierTemplatesRoot()), "otp/test_stub/sms.body.gotmpl", "otp/test_stub/sms.body*", t.m, "")
+	return template.LoadText(ctx, t.d, os.DirFS(t.d.CourierConfig().CourierTemplatesRoot(ctx)), "otp/test_stub/sms.body.gotmpl", "otp/test_stub/sms.body*", t.m, "")
 }
 
 func (t *TestStub) MarshalJSON() ([]byte, error) {
 	return json.Marshal(t.m)
+}
+
+func (t *TestStub) TemplateType() template.TemplateType {
+	return template.TypeTestStub
 }

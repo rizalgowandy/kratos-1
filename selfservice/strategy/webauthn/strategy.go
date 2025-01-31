@@ -1,10 +1,12 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package webauthn
 
 import (
 	"context"
 	"encoding/json"
-
-	"github.com/duo-labs/webauthn/webauthn"
+	"strings"
 
 	"github.com/pkg/errors"
 
@@ -22,15 +24,18 @@ import (
 	"github.com/ory/x/decoderx"
 )
 
-var _ login.Strategy = new(Strategy)
-var _ settings.Strategy = new(Strategy)
-var _ identity.ActiveCredentialsCounter = new(Strategy)
+var (
+	_ login.Strategy                    = new(Strategy)
+	_ settings.Strategy                 = new(Strategy)
+	_ identity.ActiveCredentialsCounter = new(Strategy)
+)
 
-type registrationStrategyDependencies interface {
+type webauthnStrategyDependencies interface {
 	x.LoggingProvider
 	x.WriterProvider
 	x.CSRFTokenGeneratorProvider
 	x.CSRFProvider
+	x.TracingProvider
 
 	config.Provider
 
@@ -66,37 +71,48 @@ type registrationStrategyDependencies interface {
 }
 
 type Strategy struct {
-	d  registrationStrategyDependencies
+	d  webauthnStrategyDependencies
 	hd *decoderx.HTTP
 }
 
-func NewStrategy(d registrationStrategyDependencies) *Strategy {
+func NewStrategy(d any) *Strategy {
 	return &Strategy{
-		d:  d,
+		d:  d.(webauthnStrategyDependencies),
 		hd: decoderx.NewHTTP(),
 	}
 }
 
-func (s *Strategy) CountActiveMultiFactorCredentials(cc map[identity.CredentialsType]identity.Credentials) (count int, err error) {
+func (s *Strategy) CountActiveMultiFactorCredentials(_ context.Context, cc map[identity.CredentialsType]identity.Credentials) (count int, err error) {
 	return s.countCredentials(cc, false)
 }
 
-func (s *Strategy) CountActiveFirstFactorCredentials(cc map[identity.CredentialsType]identity.Credentials) (count int, err error) {
+func (s *Strategy) CountActiveFirstFactorCredentials(_ context.Context, cc map[identity.CredentialsType]identity.Credentials) (count int, err error) {
 	return s.countCredentials(cc, true)
 }
 
-func (s *Strategy) countCredentials(cc map[identity.CredentialsType]identity.Credentials, passwordless bool) (count int, err error) {
+func (s *Strategy) countCredentials(cc map[identity.CredentialsType]identity.Credentials, onlyPasswordlessCredentials bool) (count int, err error) {
 	for _, c := range cc {
-		if c.Type == s.ID() && len(c.Config) > 0 && len(c.Identifiers) > 0 {
-			var conf CredentialsConfig
+		if c.Type == s.ID() && len(c.Config) > 0 {
+			var conf identity.CredentialsWebAuthnConfig
 			if err = json.Unmarshal(c.Config, &conf); err != nil {
 				return 0, errors.WithStack(err)
 			}
 
-			for _, c := range conf.Credentials {
-				if c.IsPasswordless == passwordless {
-					count++
+			for _, cred := range conf.Credentials {
+				if cred.IsPasswordless && len(strings.Join(c.Identifiers, "")) == 0 {
+					// If this is a passwordless credential, it will only work if the identifier is set, as
+					// we use the identifier to look up the identity. If the identifier is not set, we can
+					// assume that the user can't sign in using this method.
+					continue
 				}
+
+				if cred.IsPasswordless != onlyPasswordlessCredentials {
+					continue
+				}
+
+				// If the credential is passwordless and we require passwordless credentials, or if the credential is not
+				// passwordless and we require non-passwordless credentials, we count it.
+				count++
 			}
 		}
 	}
@@ -111,19 +127,9 @@ func (s *Strategy) NodeGroup() node.UiNodeGroup {
 	return node.WebAuthnGroup
 }
 
-func (s *Strategy) newWebAuthn(ctx context.Context) (*webauthn.WebAuthn, error) {
-	c := s.d.Config(ctx)
-	web, err := webauthn.New(c.WebAuthnConfig())
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	return web, nil
-}
-
 func (s *Strategy) CompletedAuthenticationMethod(ctx context.Context) session.AuthenticationMethod {
 	aal := identity.AuthenticatorAssuranceLevel1
-	if !s.d.Config(ctx).WebAuthnForPasswordless() {
+	if !s.d.Config().WebAuthnForPasswordless(ctx) {
 		aal = identity.AuthenticatorAssuranceLevel2
 	}
 	return session.AuthenticationMethod{

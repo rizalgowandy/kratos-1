@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package totp
 
 import (
@@ -22,15 +25,16 @@ import (
 // So we need 160/8 = 20 key length. stdtotp.Generate uses the key
 // length for reading from crypto.Rand.
 const secretSize = 160 / 8
+const digits = otp.DigitsSix
 
 func NewKey(ctx context.Context, accountName string, d interface {
 	config.Provider
 }) (*otp.Key, error) {
 	key, err := stdtotp.Generate(stdtotp.GenerateOpts{
-		Issuer:      d.Config(ctx).TOTPIssuer(),
+		Issuer:      d.Config().TOTPIssuer(ctx),
 		AccountName: accountName,
 		SecretSize:  secretSize,
-		Digits:      otp.DigitsSix,
+		Digits:      digits,
 		Period:      30,
 	})
 	if err != nil {

@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package continuity
 
 import (
@@ -17,7 +20,7 @@ func TestManagerOptions(t *testing.T) {
 	}{
 		{
 			e: func(t *testing.T, actual *managerOptions) {
-				assert.EqualValues(t, time.Minute, actual.ttl)
+				assert.EqualValues(t, time.Minute*10, actual.ttl)
 			},
 		},
 		{

@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package profile
 
 import (
@@ -6,6 +9,10 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ory/x/otelx"
+
+	"github.com/ory/jsonschema/v3"
+	"github.com/ory/kratos/selfservice/flow/registration"
 	"github.com/ory/kratos/text"
 
 	"github.com/gofrs/uuid"
@@ -13,7 +20,6 @@ import (
 	"github.com/tidwall/sjson"
 
 	"github.com/ory/herodot"
-	"github.com/ory/jsonschema/v3"
 	"github.com/ory/kratos/continuity"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
@@ -36,6 +42,7 @@ type (
 		x.CSRFTokenGeneratorProvider
 		x.WriterProvider
 		x.LoggingProvider
+		x.TracingProvider
 
 		config.Provider
 
@@ -56,7 +63,9 @@ type (
 		settings.StrategyProvider
 		settings.HooksProvider
 
-		schema.IdentityTraitsProvider
+		registration.FlowPersistenceProvider
+
+		schema.IdentitySchemaProvider
 	}
 	Strategy struct {
 		d  strategyDependencies
@@ -64,35 +73,33 @@ type (
 	}
 )
 
-// swagger:model settingsProfileFormConfig
-type SettingsProfileRequestMethod struct {
-	*container.Container
-}
-
-func NewStrategy(d strategyDependencies) *Strategy {
-	return &Strategy{d: d, dc: decoderx.NewHTTP()}
+func NewStrategy(d any) *Strategy {
+	return &Strategy{d: d.(strategyDependencies), dc: decoderx.NewHTTP()}
 }
 
 func (s *Strategy) SettingsStrategyID() string {
 	return settings.StrategyProfile
 }
 
-func (s *Strategy) RegisterSettingsRoutes(public *x.RouterPublic) {}
+func (s *Strategy) RegisterSettingsRoutes(_ *x.RouterPublic) {}
 
-func (s *Strategy) PopulateSettingsMethod(r *http.Request, id *identity.Identity, f *settings.Flow) error {
-	schemas, err := s.d.Config(r.Context()).IdentityTraitsSchemas()
+func (s *Strategy) PopulateSettingsMethod(ctx context.Context, r *http.Request, id *identity.Identity, f *settings.Flow) (err error) {
+	ctx, span := s.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.profile.Strategy.PopulateSettingsMethod")
+	defer otelx.End(span, &err)
+
+	schemas, err := s.d.IdentityTraitsSchemas(ctx)
 	if err != nil {
 		return err
 	}
 
-	traitsSchema, err := schemas.FindSchemaByID(id.SchemaID)
+	traitsSchema, err := schemas.GetByID(id.SchemaID)
 	if err != nil {
 		return err
 	}
 
 	// use a schema compiler that disables identifiers
 	schemaCompiler := jsonschema.NewCompiler()
-	nodes, err := container.NodesFromJSONSchema(r.Context(), node.ProfileGroup, traitsSchema.URL, "", schemaCompiler)
+	nodes, err := container.NodesFromJSONSchema(ctx, node.ProfileGroup, traitsSchema.URL.String(), "", schemaCompiler)
 	if err != nil {
 		return err
 	}
@@ -108,22 +115,25 @@ func (s *Strategy) PopulateSettingsMethod(r *http.Request, id *identity.Identity
 	return nil
 }
 
-func (s *Strategy) Settings(w http.ResponseWriter, r *http.Request, f *settings.Flow, ss *session.Session) (*settings.UpdateContext, error) {
-	var p submitSelfServiceSettingsFlowWithProfileMethodBody
+func (s *Strategy) Settings(ctx context.Context, w http.ResponseWriter, r *http.Request, f *settings.Flow, ss *session.Session) (_ *settings.UpdateContext, err error) {
+	ctx, span := s.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.profile.Strategy.Settings")
+	defer otelx.End(span, &err)
+
+	var p updateSettingsFlowWithProfileMethod
 	ctxUpdate, err := settings.PrepareUpdate(s.d, w, r, f, ss, settings.ContinuityKey(s.SettingsStrategyID()), &p)
 	if errors.Is(err, settings.ErrContinuePreviousAction) {
-		return ctxUpdate, s.continueFlow(w, r, ctxUpdate, &p)
+		return ctxUpdate, s.continueFlow(ctx, r, ctxUpdate, p)
 	} else if err != nil {
-		return ctxUpdate, s.handleSettingsError(w, r, ctxUpdate, nil, &p, err)
+		return ctxUpdate, s.handleSettingsError(ctx, w, r, ctxUpdate, nil, p, err)
 	}
 
-	if err := flow.MethodEnabledAndAllowedFromRequest(r, s.SettingsStrategyID(), s.d); err != nil {
+	if err := flow.MethodEnabledAndAllowedFromRequest(r, f.GetFlowName(), s.SettingsStrategyID(), s.d); err != nil {
 		return ctxUpdate, err
 	}
 
-	option, err := s.newSettingsProfileDecoder(r.Context(), ctxUpdate.GetSessionIdentity())
+	option, err := s.newSettingsProfileDecoder(ctx, ctxUpdate.GetSessionIdentity())
 	if err != nil {
-		return ctxUpdate, s.handleSettingsError(w, r, ctxUpdate, nil, &p, err)
+		return ctxUpdate, s.handleSettingsError(ctx, w, r, ctxUpdate, nil, p, err)
 	}
 
 	if err := s.dc.Decode(r, &p, option,
@@ -131,25 +141,25 @@ func (s *Strategy) Settings(w http.ResponseWriter, r *http.Request, f *settings.
 		decoderx.HTTPDecoderSetValidatePayloads(true),
 		decoderx.HTTPDecoderJSONFollowsFormFormat(),
 	); err != nil {
-		return ctxUpdate, s.handleSettingsError(w, r, ctxUpdate, nil, &p, err)
+		return ctxUpdate, s.handleSettingsError(ctx, w, r, ctxUpdate, nil, p, err)
 	}
 
 	// Reset after decoding form
 	p.SetFlowID(ctxUpdate.Flow.ID)
 
-	if err := s.continueFlow(w, r, ctxUpdate, &p); err != nil {
-		return ctxUpdate, s.handleSettingsError(w, r, ctxUpdate, nil, &p, err)
+	if err := s.continueFlow(ctx, r, ctxUpdate, p); err != nil {
+		return ctxUpdate, s.handleSettingsError(ctx, w, r, ctxUpdate, nil, p, err)
 	}
 
 	return ctxUpdate, nil
 }
 
-func (s *Strategy) continueFlow(w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *submitSelfServiceSettingsFlowWithProfileMethodBody) error {
-	if err := flow.MethodEnabledAndAllowed(r.Context(), s.SettingsStrategyID(), p.Method, s.d); err != nil {
+func (s *Strategy) continueFlow(ctx context.Context, r *http.Request, ctxUpdate *settings.UpdateContext, p updateSettingsFlowWithProfileMethod) error {
+	if err := flow.MethodEnabledAndAllowed(ctx, flow.SettingsFlow, s.SettingsStrategyID(), p.Method, s.d); err != nil {
 		return err
 	}
 
-	if err := flow.EnsureCSRF(s.d, r, ctxUpdate.Flow.Type, s.d.Config(r.Context()).DisableAPIFlowEnforcement(), s.d.GenerateCSRFToken, p.CSRFToken); err != nil {
+	if err := flow.EnsureCSRF(s.d, r, ctxUpdate.Flow.Type, s.d.Config().DisableAPIFlowEnforcement(ctx), s.d.GenerateCSRFToken, p.CSRFToken); err != nil {
 		return err
 	}
 
@@ -157,17 +167,17 @@ func (s *Strategy) continueFlow(w http.ResponseWriter, r *http.Request, ctxUpdat
 		return errors.WithStack(herodot.ErrBadRequest.WithReasonf("Did not receive any value changes."))
 	}
 
-	if err := s.hydrateForm(r, ctxUpdate.Flow, ctxUpdate.Session, p.Traits); err != nil {
+	if err := s.hydrateForm(r, ctxUpdate.Flow, p.Traits); err != nil {
 		return err
 	}
 
 	options := []identity.ManagerOption{identity.ManagerExposeValidationErrorsForInternalTypeAssertion}
-	ttl := s.d.Config(r.Context()).SelfServiceFlowSettingsPrivilegedSessionMaxAge()
+	ttl := s.d.Config().SelfServiceFlowSettingsPrivilegedSessionMaxAge(ctx)
 	if ctxUpdate.Session.AuthenticatedAt.Add(ttl).After(time.Now()) {
 		options = append(options, identity.ManagerAllowWriteProtectedTraits)
 	}
 
-	update, err := s.d.IdentityManager().SetTraits(r.Context(), ctxUpdate.GetSessionIdentity().ID, identity.Traits(p.Traits), options...)
+	update, err := s.d.IdentityManager().SetTraits(ctx, ctxUpdate.GetSessionIdentity().ID, identity.Traits(p.Traits), options...)
 	if err != nil {
 		if errors.Is(err, identity.ErrProtectedFieldModified) {
 			return settings.NewFlowNeedsReAuth()
@@ -179,10 +189,16 @@ func (s *Strategy) continueFlow(w http.ResponseWriter, r *http.Request, ctxUpdat
 	return nil
 }
 
-// nolint:deadcode,unused
-// swagger:model submitSelfServiceSettingsFlowWithProfileMethodBody
-type submitSelfServiceSettingsFlowWithProfileMethodBody struct {
-	// Traits contains all of the identity's traits.
+// Update Settings Flow with Profile Method
+//
+// swagger:model updateSettingsFlowWithProfileMethod
+//
+//nolint:deadcode,unused
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
+type updateSettingsFlowWithProfileMethod struct {
+	// Traits
+	//
+	// The identity's traits.
 	//
 	// required: true
 	Traits json.RawMessage `json:"traits"`
@@ -203,17 +219,22 @@ type submitSelfServiceSettingsFlowWithProfileMethodBody struct {
 	//
 	// This token is only required when performing browser flows.
 	CSRFToken string `json:"csrf_token"`
+
+	// Transient data to pass along to any webhooks
+	//
+	// required: false
+	TransientPayload json.RawMessage `json:"transient_payload,omitempty" form:"transient_payload"`
 }
 
-func (p *submitSelfServiceSettingsFlowWithProfileMethodBody) GetFlowID() uuid.UUID {
+func (p *updateSettingsFlowWithProfileMethod) GetFlowID() uuid.UUID {
 	return x.ParseUUID(p.FlowID)
 }
 
-func (p *submitSelfServiceSettingsFlowWithProfileMethodBody) SetFlowID(rid uuid.UUID) {
+func (p *updateSettingsFlowWithProfileMethod) SetFlowID(rid uuid.UUID) {
 	p.FlowID = rid.String()
 }
 
-func (s *Strategy) hydrateForm(r *http.Request, ar *settings.Flow, ss *session.Session, traits json.RawMessage) error {
+func (s *Strategy) hydrateForm(r *http.Request, ar *settings.Flow, traits json.RawMessage) error {
 	if traits != nil {
 		ar.UI.Nodes.ResetNodesWithPrefix("traits.")
 		ar.UI.UpdateNodeValuesFromJSON(traits, "traits", node.ProfileGroup)
@@ -225,9 +246,9 @@ func (s *Strategy) hydrateForm(r *http.Request, ar *settings.Flow, ss *session.S
 
 // handleSettingsError is a convenience function for handling all types of errors that may occur (e.g. validation error)
 // during a settings request.
-func (s *Strategy) handleSettingsError(w http.ResponseWriter, r *http.Request, puc *settings.UpdateContext, traits json.RawMessage, p *submitSelfServiceSettingsFlowWithProfileMethodBody, err error) error {
+func (s *Strategy) handleSettingsError(ctx context.Context, w http.ResponseWriter, r *http.Request, puc *settings.UpdateContext, traits json.RawMessage, p updateSettingsFlowWithProfileMethod, err error) error {
 	if e := new(settings.FlowNeedsReAuth); errors.As(err, &e) {
-		if err := s.d.ContinuityManager().Pause(r.Context(), w, r,
+		if err := s.d.ContinuityManager().Pause(ctx, w, r,
 			settings.ContinuityKey(s.SettingsStrategyID()),
 			settings.ContinuityOptions(p, puc.GetSessionIdentity())...); err != nil {
 			return err
@@ -243,7 +264,7 @@ func (s *Strategy) handleSettingsError(w http.ResponseWriter, r *http.Request, p
 			}
 		}
 
-		if err := s.hydrateForm(r, puc.Flow, puc.Session, traits); err != nil {
+		if err := s.hydrateForm(r, puc.Flow, traits); err != nil {
 			return err
 		}
 	}

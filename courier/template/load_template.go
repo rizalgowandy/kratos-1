@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package template
 
 import (
@@ -10,32 +13,30 @@ import (
 	"path/filepath"
 	"text/template"
 
-	"github.com/hashicorp/go-retryablehttp"
-
+	"github.com/ory/kratos/x"
 	"github.com/ory/x/fetcher"
-	"github.com/ory/x/httpx"
 
 	"github.com/Masterminds/sprig/v3"
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/pkg/errors"
 )
 
 //go:embed courier/builtin/templates/*
 var templates embed.FS
 
-var Cache, _ = lru.New(16)
+var Cache, _ = lru.New[string, Template](16)
 
 type Template interface {
 	Execute(wr io.Writer, data interface{}) error
 }
 
 type templateDependencies interface {
-	HTTPClient(ctx context.Context, opts ...httpx.ResilientOptions) *retryablehttp.Client
+	x.HTTPClientProvider
 }
 
 func loadBuiltInTemplate(filesystem fs.FS, name string, html bool) (Template, error) {
 	if t, found := Cache.Get(name); found {
-		return t.(Template), nil
+		return t, nil
 	}
 
 	file, err := filesystem.Open(name)
@@ -75,24 +76,18 @@ func loadBuiltInTemplate(filesystem fs.FS, name string, html bool) (Template, er
 	return tpl, nil
 }
 
-func loadRemoteTemplate(ctx context.Context, d templateDependencies, url string, html bool) (Template, error) {
-	var b []byte
-	var err error
-
-	// instead of creating a new request always we always cache the bytes.Buffer using the url as the key
+func loadRemoteTemplate(ctx context.Context, d templateDependencies, url string, html bool) (t Template, err error) {
 	if t, found := Cache.Get(url); found {
-		b = t.([]byte)
-	} else {
-		f := fetcher.NewFetcher(fetcher.WithClient(d.HTTPClient(ctx)))
-		bb, err := f.Fetch(url)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		b = bb.Bytes()
-		_ = Cache.Add(url, b)
+		return t, nil
 	}
 
-	var t Template
+	f := fetcher.NewFetcher(fetcher.WithClient(d.HTTPClient(ctx)))
+	bb, err := f.FetchContext(ctx, url)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	b := bb.Bytes()
+
 	if html {
 		t, err = htemplate.New(url).Funcs(sprig.HermeticHtmlFuncMap()).Parse(string(b))
 		if err != nil {
@@ -104,13 +99,14 @@ func loadRemoteTemplate(ctx context.Context, d templateDependencies, url string,
 			return nil, errors.WithStack(err)
 		}
 	}
+	Cache.Add(url, t)
 
 	return t, nil
 }
 
 func loadTemplate(filesystem fs.FS, name, pattern string, html bool) (Template, error) {
 	if t, found := Cache.Get(name); found {
-		return t.(Template), nil
+		return t, nil
 	}
 
 	matches, _ := fs.Glob(filesystem, name)

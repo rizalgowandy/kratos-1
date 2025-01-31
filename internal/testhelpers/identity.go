@@ -1,7 +1,9 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package testhelpers
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -14,11 +16,11 @@ import (
 )
 
 func CreateSession(t *testing.T, reg driver.Registry) *session.Session {
-	ctx := context.Background()
+	req := NewTestHTTPRequest(t, "GET", "/sessions/whoami", nil)
 	i := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
-	require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(ctx, i))
-	sess, err := session.NewActiveSession(i, reg.Config(ctx), time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+	require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(req.Context(), i))
+	sess, err := NewActiveSession(req, reg, i, time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
 	require.NoError(t, err)
-	require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
+	require.NoError(t, reg.SessionPersister().UpsertSession(req.Context(), sess))
 	return sess
 }

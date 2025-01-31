@@ -1,6 +1,12 @@
-codecov:
-  ignore:
-    - "test"
-    - "internal"
-    - "docs"
-    - "contrib"
+coverage:
+  status:
+    project:
+      default:
+        target: 65%
+        threshold: 10%
+        only_pulls: true
+ignore:
+  - "test"
+  - "internal"
+  - "docs"
+  - "contrib"

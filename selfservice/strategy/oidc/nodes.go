@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
@@ -5,10 +8,10 @@ import (
 	"github.com/ory/kratos/ui/node"
 )
 
-func NewLinkNode(provider string) *node.Node {
-	return node.NewInputField("link", provider, node.OpenIDConnectGroup, node.InputAttributeTypeSubmit).WithMetaLabel(text.NewInfoSelfServiceSettingsUpdateLinkOIDC(provider))
+func NewLinkNode(providerID, providerLabel string) *node.Node {
+	return node.NewInputField("link", providerID, node.OpenIDConnectGroup, node.InputAttributeTypeSubmit).WithMetaLabel(text.NewInfoSelfServiceSettingsUpdateLinkOIDC(providerLabel))
 }
 
-func NewUnlinkNode(provider string) *node.Node {
-	return node.NewInputField("unlink", provider, node.OpenIDConnectGroup, node.InputAttributeTypeSubmit).WithMetaLabel(text.NewInfoSelfServiceSettingsUpdateUnlinkOIDC(provider))
+func NewUnlinkNode(providerID, providerLabel string) *node.Node {
+	return node.NewInputField("unlink", providerID, node.OpenIDConnectGroup, node.InputAttributeTypeSubmit).WithMetaLabel(text.NewInfoSelfServiceSettingsUpdateUnlinkOIDC(providerLabel))
 }

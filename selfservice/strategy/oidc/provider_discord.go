@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
@@ -16,15 +19,17 @@ import (
 	"github.com/ory/x/stringsx"
 )
 
+var _ OAuth2Provider = (*ProviderDiscord)(nil)
+
 type ProviderDiscord struct {
 	config *Configuration
-	reg    dependencies
+	reg    Dependencies
 }
 
 func NewProviderDiscord(
 	config *Configuration,
-	reg dependencies,
-) *ProviderDiscord {
+	reg Dependencies,
+) Provider {
 	return &ProviderDiscord{
 		config: config,
 		reg:    reg,
@@ -43,7 +48,7 @@ func (d *ProviderDiscord) oauth2(ctx context.Context) *oauth2.Config {
 			AuthURL:  discordgo.EndpointOauth2 + "authorize",
 			TokenURL: discordgo.EndpointOauth2 + "token",
 		},
-		RedirectURL: d.config.Redir(d.reg.Config(ctx).OIDCRedirectURIBase()),
+		RedirectURL: d.config.Redir(d.reg.Config().OIDCRedirectURIBase(ctx)),
 		Scopes:      d.config.Scope,
 	}
 }
@@ -90,7 +95,7 @@ func (d *ProviderDiscord) Claims(ctx context.Context, exchange *oauth2.Token, qu
 		Picture:           user.AvatarURL(""),
 		Email:             user.Email,
 		EmailVerified:     x.ConvertibleBoolean(user.Verified),
-		Locale:            user.Locale,
+		Locale:            Locale(user.Locale),
 	}
 
 	return claims, nil

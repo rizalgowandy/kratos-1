@@ -1,25 +1,14 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package template
 
 import (
-	"context"
-
-	"github.com/hashicorp/go-retryablehttp"
-
 	"github.com/ory/kratos/driver/config"
-	"github.com/ory/x/httpx"
+	"github.com/ory/kratos/x"
 )
 
-type (
-	Config interface {
-		CourierTemplatesRoot() string
-		CourierTemplatesVerificationInvalid() *config.CourierEmailTemplate
-		CourierTemplatesVerificationValid() *config.CourierEmailTemplate
-		CourierTemplatesRecoveryInvalid() *config.CourierEmailTemplate
-		CourierTemplatesRecoveryValid() *config.CourierEmailTemplate
-	}
-
-	Dependencies interface {
-		CourierConfig(ctx context.Context) config.CourierConfigs
-		HTTPClient(ctx context.Context, opts ...httpx.ResilientOptions) *retryablehttp.Client
-	}
-)
+type Dependencies interface {
+	CourierConfig() config.CourierConfigs
+	x.HTTPClientProvider
+}

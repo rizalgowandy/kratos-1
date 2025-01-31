@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package flowhelpers_test
 
 import (
@@ -14,7 +17,6 @@ import (
 	"github.com/ory/kratos/internal/testhelpers"
 	"github.com/ory/kratos/selfservice/flow/login"
 	"github.com/ory/kratos/selfservice/flowhelpers"
-	"github.com/ory/kratos/session"
 )
 
 func TestGuessForcedLoginIdentifier(t *testing.T) {
@@ -29,9 +31,11 @@ func TestGuessForcedLoginIdentifier(t *testing.T) {
 	i.Credentials[identity.CredentialsTypePassword] = ic
 	require.NoError(t, reg.IdentityManager().Create(context.Background(), i))
 
-	sess, err := session.NewActiveSession(i, conf, time.Now(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+	req := httptest.NewRequest("GET", "/sessions/whoami", nil)
+
+	sess, err := testhelpers.NewActiveSession(req, reg, i, time.Now(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
 	require.NoError(t, err)
-	reg.SessionPersister().UpsertSession(context.Background(), sess)
+	require.NoError(t, reg.SessionPersister().UpsertSession(context.Background(), sess))
 
 	r := httptest.NewRequest("GET", "/login", nil)
 	r.Header.Set("Authorization", "Bearer "+sess.Token)

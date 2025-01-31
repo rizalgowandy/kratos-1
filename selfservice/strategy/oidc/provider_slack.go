@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
@@ -16,15 +19,17 @@ import (
 	"github.com/slack-go/slack"
 )
 
+var _ OAuth2Provider = (*ProviderSlack)(nil)
+
 type ProviderSlack struct {
 	config *Configuration
-	reg    dependencies
+	reg    Dependencies
 }
 
 func NewProviderSlack(
 	config *Configuration,
-	reg dependencies,
-) *ProviderSlack {
+	reg Dependencies,
+) Provider {
 	return &ProviderSlack{
 		config: config,
 		reg:    reg,
@@ -45,7 +50,7 @@ func (d *ProviderSlack) oauth2(ctx context.Context) *oauth2.Config {
 			AuthURL:  "https://slack.com/oauth/authorize",
 			TokenURL: slack.APIURL + "oauth.access",
 		},
-		RedirectURL: d.config.Redir(d.reg.Config(ctx).OIDCRedirectURIBase()),
+		RedirectURL: d.config.Redir(d.reg.Config().OIDCRedirectURIBase(ctx)),
 		Scopes:      d.config.Scope,
 	}
 }

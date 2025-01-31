@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
@@ -5,6 +8,8 @@ import (
 	"encoding/json"
 	"net/url"
 	"path"
+
+	"github.com/ory/x/stringsx"
 
 	"github.com/hashicorp/go-retryablehttp"
 
@@ -20,14 +25,16 @@ const (
 	defaultEndpoint = "https://gitlab.com"
 )
 
+var _ OAuth2Provider = (*ProviderGitLab)(nil)
+
 type ProviderGitLab struct {
 	*ProviderGenericOIDC
 }
 
 func NewProviderGitLab(
 	config *Configuration,
-	reg dependencies,
-) *ProviderGitLab {
+	reg Dependencies,
+) Provider {
 	return &ProviderGitLab{
 		ProviderGenericOIDC: &ProviderGenericOIDC{
 			config: config,
@@ -56,7 +63,7 @@ func (g *ProviderGitLab) oauth2(ctx context.Context) (*oauth2.Config, error) {
 			TokenURL: tokenUrl.String(),
 		},
 		Scopes:      g.config.Scope,
-		RedirectURL: g.config.Redir(g.reg.Config(ctx).OIDCRedirectURIBase()),
+		RedirectURL: g.config.Redir(g.reg.Config().OIDCRedirectURIBase(ctx)),
 	}, nil
 }
 
@@ -70,34 +77,40 @@ func (g *ProviderGitLab) Claims(ctx context.Context, exchange *oauth2.Token, que
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 
-	client := g.reg.HTTPClient(ctx, httpx.ResilientClientDisallowInternalIPs(), httpx.ResilientClientWithClient(o.Client(ctx, exchange)))
-
 	u, err := g.endpoint()
 	if err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 	u.Path = path.Join(u.Path, "/oauth/userinfo")
-	req, err := retryablehttp.NewRequest("GET", u.String(), nil)
+
+	ctx, client := httpx.SetOAuth2(ctx, g.reg.HTTPClient(ctx), o, exchange)
+	req, err := retryablehttp.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	if err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 
+	req.Header.Set("Accept", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 	defer resp.Body.Close()
 
+	if err := logUpstreamError(g.reg.Logger(), resp); err != nil {
+		return nil, err
+	}
+
 	var claims Claims
 	if err := json.NewDecoder(resp.Body).Decode(&claims); err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 
+	claims.Issuer = stringsx.Coalesce(claims.Issuer, g.config.IssuerURL)
 	return &claims, nil
 }
 
 func (g *ProviderGitLab) endpoint() (*url.URL, error) {
-	var e = defaultEndpoint
+	e := defaultEndpoint
 	if len(g.config.IssuerURL) > 0 {
 		e = g.config.IssuerURL
 	}

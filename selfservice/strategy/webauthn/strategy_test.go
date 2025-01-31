@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package webauthn_test
 
 import (
@@ -25,7 +28,7 @@ func TestCompletedAuthenticationMethod(t *testing.T) {
 		AAL:    identity.AuthenticatorAssuranceLevel2,
 	}, strategy.CompletedAuthenticationMethod(context.Background()))
 
-	conf.MustSet(config.ViperKeyWebAuthnPasswordless, true)
+	conf.MustSet(ctx, config.ViperKeyWebAuthnPasswordless, true)
 	assert.Equal(t, session.AuthenticationMethod{
 		Method: strategy.ID(),
 		AAL:    identity.AuthenticatorAssuranceLevel1,
@@ -37,24 +40,24 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 	strategy := webauthn.NewStrategy(reg)
 
 	for k, tc := range []struct {
-		in            identity.CredentialsCollection
+		in            map[identity.CredentialsType]identity.Credentials
 		expectedFirst int
 		expectedMulti int
 	}{
 		{
-			in: identity.CredentialsCollection{{
+			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:   strategy.ID(),
 				Config: []byte{},
 			}},
 		},
 		{
-			in: identity.CredentialsCollection{{
+			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:   strategy.ID(),
 				Config: []byte(`{"credentials": []}`),
 			}},
 		},
 		{
-			in: identity.CredentialsCollection{{
+			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:        strategy.ID(),
 				Identifiers: []string{"foo"},
 				Config:      []byte(`{"credentials": [{}]}`),
@@ -62,7 +65,15 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 			expectedMulti: 1,
 		},
 		{
-			in: identity.CredentialsCollection{{
+			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
+				Type:        strategy.ID(),
+				Identifiers: []string{}, // also works without identifier
+				Config:      []byte(`{"credentials": [{}]}`),
+			}},
+			expectedMulti: 1,
+		},
+		{
+			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:        strategy.ID(),
 				Identifiers: []string{"foo"},
 				Config:      []byte(`{"credentials": [{"is_passwordless": true}]}`),
@@ -70,7 +81,14 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 			expectedFirst: 1,
 		},
 		{
-			in: identity.CredentialsCollection{{
+			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
+				Type:   strategy.ID(),
+				Config: []byte(`{"credentials": [{"is_passwordless": true}]}`),
+			}},
+			expectedFirst: 0, // missing identifier
+		},
+		{
+			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:        strategy.ID(),
 				Identifiers: []string{"foo"},
 				Config:      []byte(`{"credentials": [{"is_passwordless": true}, {"is_passwordless": true}]}`),
@@ -78,7 +96,7 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 			expectedFirst: 2,
 		},
 		{
-			in: identity.CredentialsCollection{{
+			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:        strategy.ID(),
 				Identifiers: []string{"foo"},
 				Config:      []byte(`{"credentials": [{"is_passwordless": true}, {"is_passwordless": false}]}`),
@@ -87,13 +105,13 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 			expectedMulti: 1,
 		},
 		{
-			in: identity.CredentialsCollection{{
+			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:   strategy.ID(),
 				Config: []byte(`{}`),
 			}},
 		},
 		{
-			in: identity.CredentialsCollection{{}, {}},
+			in: nil,
 		},
 	} {
 		t.Run(fmt.Sprintf("case=%d", k), func(t *testing.T) {
@@ -102,11 +120,11 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 				cc[c.Type] = c
 			}
 
-			actual, err := strategy.CountActiveFirstFactorCredentials(cc)
+			actual, err := strategy.CountActiveFirstFactorCredentials(ctx, cc)
 			require.NoError(t, err)
 			assert.Equal(t, tc.expectedFirst, actual)
 
-			actual, err = strategy.CountActiveMultiFactorCredentials(cc)
+			actual, err = strategy.CountActiveMultiFactorCredentials(ctx, cc)
 			require.NoError(t, err)
 			assert.Equal(t, tc.expectedMulti, actual)
 		})

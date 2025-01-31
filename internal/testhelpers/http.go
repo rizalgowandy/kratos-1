@@ -1,11 +1,15 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package testhelpers
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"testing"
 
@@ -14,6 +18,37 @@ import (
 
 func NewDebugClient(t *testing.T) *http.Client {
 	return &http.Client{Transport: NewTransportWithLogger(http.DefaultTransport, t)}
+}
+
+func NewClientWithCookieJar(t *testing.T, jar *cookiejar.Jar, checkRedirect CheckRedirectFunc) *http.Client {
+	if jar == nil {
+		j, err := cookiejar.New(nil)
+		jar = j
+		require.NoError(t, err)
+	}
+	if checkRedirect == nil {
+		checkRedirect = DebugRedirects(t)
+	}
+	return &http.Client{
+		Jar:           jar,
+		CheckRedirect: checkRedirect,
+	}
+}
+
+type CheckRedirectFunc func(req *http.Request, via []*http.Request) error
+
+func DebugRedirects(t *testing.T) CheckRedirectFunc {
+	return func(req *http.Request, via []*http.Request) error {
+		t.Logf("Redirect: %s", req.URL.String())
+
+		if len(via) >= 20 {
+			for k, v := range via {
+				t.Logf("Failed with redirect (%d): %s", k, v.URL.String())
+			}
+			return errors.New("stopped after 20 redirects")
+		}
+		return nil
+	}
 }
 
 func NewRequest(t *testing.T, isAPI bool, method string, url string, payload io.Reader) *http.Request {
@@ -70,7 +105,7 @@ func HTTPRequestJSON(t *testing.T, client *http.Client, method string, url strin
 	require.NoError(t, err)
 	defer res.Body.Close()
 
-	payload, err := ioutil.ReadAll(res.Body)
+	payload, err := io.ReadAll(res.Body)
 	require.NoError(t, err)
 
 	return payload, res
@@ -85,8 +120,46 @@ func HTTPPostForm(t *testing.T, client *http.Client, remote string, in *url.Valu
 	require.NoError(t, err)
 	defer res.Body.Close()
 
-	payload, err := ioutil.ReadAll(res.Body)
+	payload, err := io.ReadAll(res.Body)
 	require.NoError(t, err)
 
 	return payload, res
+}
+
+func NewTestHTTPRequest(t *testing.T, method, url string, body io.Reader) *http.Request {
+	req, err := http.NewRequest(method, url, body)
+	require.NoError(t, err)
+	return req
+}
+
+func EasyGet(t *testing.T, c *http.Client, url string) (*http.Response, []byte) {
+	res, err := c.Get(url)
+	require.NoError(t, err)
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	require.NoError(t, err)
+	return res, body
+}
+
+func EasyGetJSON(t *testing.T, c *http.Client, url string) (*http.Response, []byte) {
+	req, err := http.NewRequest("GET", url, nil)
+	require.NoError(t, err)
+	req.Header.Set("Accept", "application/json")
+	res, err := c.Do(req)
+	require.NoError(t, err)
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	require.NoError(t, err)
+	return res, body
+}
+
+func EasyGetBody(t *testing.T, c *http.Client, url string) []byte {
+	_, body := EasyGet(t, c, url) // nolint: bodyclose
+	return body
+}
+
+func EasyCookieJar(t *testing.T, o *cookiejar.Options) *cookiejar.Jar {
+	cj, err := cookiejar.New(o)
+	require.NoError(t, err)
+	return cj
 }

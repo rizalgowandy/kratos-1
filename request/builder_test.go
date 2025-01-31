@@ -1,24 +1,30 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package request
 
 import (
+	"context"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ory/kratos/x"
+	"github.com/ory/x/jsonnetsecure"
 	"github.com/ory/x/logrusx"
+	"github.com/ory/x/otelx"
 )
 
 type testRequestBody struct {
-	To   string
-	From string
-	Body string
+	To   string `json:"to"`
+	From string `json:"from"`
+	Body string `json:"body"`
 }
 
 //go:embed stub/test_body.jsonnet
@@ -47,7 +53,7 @@ func TestBuildRequest(t *testing.T) {
 				From: "+12288534869",
 				Body: "test-sms-body",
 			},
-			expectedBody: "{\n   \"Body\": \"test-sms-body\",\n   \"From\": \"+12288534869\",\n   \"To\": \"+15056445993\"\n}\n",
+			expectedBody: "{\n   \"body\": \"test-sms-body\",\n   \"from\": \"+12288534869\",\n   \"to\": \"+15056445993\"\n}\n",
 			rawConfig: `{
 				"url": "https://test.kratos.ory.sh/my_endpoint1",
 				"method": "POST",
@@ -64,7 +70,7 @@ func TestBuildRequest(t *testing.T) {
 				From: "+12288534869",
 				Body: "test-sms-body",
 			},
-			expectedBody: "{\n   \"Body\": \"test-sms-body\",\n   \"From\": \"+12288534869\",\n   \"To\": \"+15056445993\"\n}\n",
+			expectedBody: "{\n   \"body\": \"test-sms-body\",\n   \"from\": \"+12288534869\",\n   \"to\": \"+15056445993\"\n}\n",
 			rawConfig: `{
 				"url": "https://test.kratos.ory.sh/my_endpoint1",
 				"method": "POST",
@@ -81,12 +87,14 @@ func TestBuildRequest(t *testing.T) {
 				From: "+12288534869",
 				Body: "test-sms-body",
 			},
-			expectedBody: "{\n   \"Body\": \"test-sms-body\",\n   \"From\": \"+12288534869\",\n   \"To\": \"+15056445993\"\n}\n",
-			rawConfig: fmt.Sprintf(`{
+			expectedBody: "{\n   \"body\": \"test-sms-body\",\n   \"from\": \"+12288534869\",\n   \"to\": \"+15056445993\"\n}\n",
+			rawConfig: fmt.Sprintf(
+				`{
 				"url": "https://test.kratos.ory.sh/my_endpoint1",
 				"method": "POST",
 				"body": "base64://%s"
-			}`, base64.StdEncoding.EncodeToString(testJSONNetTemplate)),
+			}`, base64.StdEncoding.EncodeToString(testJSONNetTemplate),
+			),
 		},
 		{
 			name:            "POST request with custom header",
@@ -100,11 +108,11 @@ func TestBuildRequest(t *testing.T) {
 				From: "+15822228108",
 				Body: "test-sms-body",
 			},
-			expectedBody: "{\n   \"Body\": \"test-sms-body\",\n   \"From\": \"+15822228108\",\n   \"To\": \"+12127110378\"\n}\n",
+			expectedBody: "{\n   \"body\": \"test-sms-body\",\n   \"from\": \"+15822228108\",\n   \"to\": \"+12127110378\"\n}\n",
 			rawConfig: `{
 				"url": "https://test.kratos.ory.sh/my_endpoint2",
 				"method": "POST",
-				"header": {
+				"headers": {
 					"Custom-Header": "test"
 				},
 				"body": "file://./stub/test_body.jsonnet"
@@ -121,7 +129,7 @@ func TestBuildRequest(t *testing.T) {
 				From: "+13104661805",
 				Body: "test-sms-body",
 			},
-			expectedBody: "{\n   \"Body\": \"test-sms-body\",\n   \"From\": \"+13104661805\",\n   \"To\": \"+14134242223\"\n}\n",
+			expectedBody: "{\n   \"body\": \"test-sms-body\",\n   \"from\": \"+13104661805\",\n   \"to\": \"+14134242223\"\n}\n",
 			rawConfig: `{
 				"url": "https://test.kratos.ory.sh/my_endpoint3",
 				"method": "GET",
@@ -163,7 +171,7 @@ func TestBuildRequest(t *testing.T) {
 				From: "+14253787846",
 				Body: "test-sms-body",
 			},
-			expectedBody: "{\n   \"Body\": \"test-sms-body\",\n   \"From\": \"+14253787846\",\n   \"To\": \"+12235499085\"\n}\n",
+			expectedBody: "{\n   \"body\": \"test-sms-body\",\n   \"from\": \"+14253787846\",\n   \"to\": \"+12235499085\"\n}\n",
 			rawConfig: `{
 				"url": "https://test.kratos.ory.sh/my_endpoint5",
 				"method": "DELETE",
@@ -190,12 +198,12 @@ func TestBuildRequest(t *testing.T) {
 				From: "+13104661805",
 				Body: "test-sms-body",
 			},
-			expectedBody: "Body=test-sms-body&From=%2B13104661805&To=%2B14134242223",
+			expectedBody: "body=test-sms-body&from=%2B13104661805&to=%2B14134242223",
 			rawConfig: `{
 				"url": "https://test.kratos.ory.sh/my_endpoint6",
 				"method": "POST",
 				"body": "file://./stub/test_body.jsonnet",
-				"header": {
+				"headers": {
 					"Content-Type": "application/x-www-form-urlencoded"
 				},
 				"auth": {
@@ -220,7 +228,7 @@ func TestBuildRequest(t *testing.T) {
 				From: "+13104661805",
 				Body: "test-sms-body",
 			},
-			expectedBody: "{\n   \"Body\": \"test-sms-body\",\n   \"From\": \"+13104661805\",\n   \"To\": \"+14134242223\"\n}\n",
+			expectedBody: "{\n   \"body\": \"test-sms-body\",\n   \"from\": \"+13104661805\",\n   \"to\": \"+14134242223\"\n}\n",
 			rawConfig: `{
 				"url": "https://test.kratos.ory.sh/my_endpoint7",
 				"method": "POST",
@@ -235,50 +243,68 @@ func TestBuildRequest(t *testing.T) {
 			}`,
 		},
 	} {
-		t.Run("request-type="+tc.name, func(t *testing.T) {
-			l := logrusx.New("kratos", "test")
-
-			rb, err := NewBuilder(json.RawMessage(tc.rawConfig), nil, l)
-			require.NoError(t, err)
-
-			assert.Equal(t, tc.bodyTemplateURI, rb.conf.TemplateURI)
-			assert.Equal(t, tc.authStrategy, rb.conf.Auth.Type)
-
-			req, err := rb.BuildRequest(tc.body)
-			require.NoError(t, err)
-
-			assert.Equal(t, tc.url, req.URL.String())
-			assert.Equal(t, tc.method, req.Method)
-
-			if tc.body != nil {
-				requestBody, err := ioutil.ReadAll(req.Body)
+		t.Run(
+			"request-type="+tc.name, func(t *testing.T) {
+				rb, err := NewBuilder(context.Background(), json.RawMessage(tc.rawConfig), newTestDependencyProvider(t))
 				require.NoError(t, err)
 
-				assert.Equal(t, tc.expectedBody, string(requestBody))
-			}
+				assert.Equal(t, tc.bodyTemplateURI, rb.Config.TemplateURI)
+				assert.Equal(t, tc.authStrategy, rb.Config.Auth.Type)
 
-			if tc.expectedHeader != nil {
-				mustContainHeader(t, tc.expectedHeader, req.Header)
-			}
-		})
+				req, err := rb.BuildRequest(context.Background(), tc.body)
+				require.NoError(t, err)
+
+				assert.Equal(t, tc.url, req.URL.String())
+				assert.Equal(t, tc.method, req.Method)
+
+				if tc.body != nil {
+					requestBody, err := req.BodyBytes()
+					require.NoError(t, err)
+
+					assert.Equal(t, tc.expectedBody, string(requestBody))
+				}
+
+				if tc.expectedHeader != nil {
+					mustContainHeader(t, tc.expectedHeader, req.Header)
+				}
+			},
+		)
 	}
 
-	t.Run("cancel request", func(t *testing.T) {
-		l := logrusx.New("kratos", "test")
-
-		rb, err := NewBuilder(json.RawMessage(`{
+	t.Run(
+		"cancel request", func(t *testing.T) {
+			rb, err := NewBuilder(context.Background(), json.RawMessage(
+				`{
 	"url": "https://test.kratos.ory.sh/my_endpoint6",
 	"method": "POST",
 	"body": "file://./stub/cancel_body.jsonnet"
-}`), nil, l)
-		require.NoError(t, err)
+}`,
+			), newTestDependencyProvider(t))
+			require.NoError(t, err)
 
-		_, err = rb.BuildRequest(json.RawMessage(`{}`))
-		require.ErrorIs(t, err, ErrCancel)
-	})
+			_, err = rb.BuildRequest(context.Background(), json.RawMessage(`{}`))
+			require.ErrorIs(t, err, ErrCancel)
+		},
+	)
+}
+
+type testDependencyProvider struct {
+	x.SimpleLoggerWithClient
+	*jsonnetsecure.TestProvider
+}
+
+func newTestDependencyProvider(t *testing.T) *testDependencyProvider {
+	return &testDependencyProvider{
+		SimpleLoggerWithClient: x.SimpleLoggerWithClient{
+			L: logrusx.New("kratos", "test"),
+			T: otelx.NewNoop(nil, nil),
+		},
+		TestProvider: jsonnetsecure.NewTestProvider(t),
+	}
 }
 
 func mustContainHeader(t *testing.T, expected http.Header, actual http.Header) {
+	t.Helper()
 	for k := range expected {
 		require.Contains(t, actual, k)
 		assert.Equal(t, expected[k], actual[k])

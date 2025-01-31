@@ -1,32 +1,22 @@
-/*
-Copyright © 2019 NAME HERE <EMAIL ADDRESS>
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package migrate
 
 import (
 	"github.com/spf13/cobra"
 
 	"github.com/ory/kratos/cmd/cliclient"
+	"github.com/ory/kratos/driver"
 	"github.com/ory/x/configx"
 )
 
 // migrateSqlCmd represents the sql command
-func NewMigrateSQLCmd() *cobra.Command {
+func NewMigrateSQLCmd(opts ...driver.RegistryOption) *cobra.Command {
 	c := &cobra.Command{
-		Use:   "sql <database-url>",
-		Short: "Create SQL schemas and apply migration plans",
+		Use:        "sql <database-url>",
+		Deprecated: "Please use `hydra migrate sql` instead.",
+		Short:      "Create SQL schemas and apply migration plans",
 		Long: `Run this command on a fresh SQL installation and when you upgrade Ory Kratos to a new minor version.
 
 It is recommended to run this command close to the SQL instance (e.g. same subnet) instead of over the public internet.
@@ -40,13 +30,18 @@ You can read in the database URL using the -e flag, for example:
 
 Before running this command on an existing database, create a back up!
 `,
-		Run: func(cmd *cobra.Command, args []string) {
-			cliclient.NewMigrateHandler().MigrateSQL(cmd, args)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cliclient.NewMigrateHandler().MigrateSQLUp(cmd, args, opts...)
 		},
 	}
 
 	configx.RegisterFlags(c.PersistentFlags())
-	c.Flags().BoolP("read-from-env", "e", false, "If set, reads the database connection string from the environment variable DSN or config file key dsn.")
+	c.PersistentFlags().BoolP("read-from-env", "e", false, "If set, reads the database connection string from the environment variable DSN or config file key dsn.")
 	c.Flags().BoolP("yes", "y", false, "If set all confirmation requests are accepted without user interaction.")
+
+	c.AddCommand(NewMigrateSQLStatusCmd(opts...))
+	c.AddCommand(NewMigrateSQLUpCmd(opts...))
+	c.AddCommand(NewMigrateSQLDownCmd(opts...))
+
 	return c
 }

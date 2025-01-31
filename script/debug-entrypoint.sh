@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 FILE_CHANGE_LOG_FILE=/tmp/changes.log
 SERVICE_ARGS="$@"
@@ -17,7 +17,7 @@ build() {
   log "Building ${SERVICE_NAME} binary"
   go env -w GOPROXY="proxy.golang.org,direct"
   go mod download
-  go build -gcflags "all=-N -l" -o /${SERVICE_NAME}
+  go build -buildvcs=false -gcflags "all=-N -l" -o /${SERVICE_NAME}
 }
 
 start() {

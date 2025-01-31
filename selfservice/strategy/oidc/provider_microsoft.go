@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
@@ -6,19 +9,18 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/hashicorp/go-retryablehttp"
-
-	"github.com/ory/x/httpx"
-
+	gooidc "github.com/coreos/go-oidc/v3/oidc"
 	"github.com/gofrs/uuid"
 	"github.com/golang-jwt/jwt/v4"
-
-	gooidc "github.com/coreos/go-oidc"
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
 
 	"github.com/ory/herodot"
+	"github.com/ory/x/httpx"
 )
+
+var _ OAuth2Provider = (*ProviderMicrosoft)(nil)
 
 type ProviderMicrosoft struct {
 	*ProviderGenericOIDC
@@ -26,8 +28,8 @@ type ProviderMicrosoft struct {
 
 func NewProviderMicrosoft(
 	config *Configuration,
-	reg dependencies,
-) *ProviderMicrosoft {
+	reg Dependencies,
+) Provider {
 	return &ProviderMicrosoft{
 		ProviderGenericOIDC: &ProviderGenericOIDC{
 			config: config,
@@ -37,7 +39,7 @@ func NewProviderMicrosoft(
 }
 
 func (m *ProviderMicrosoft) OAuth2(ctx context.Context) (*oauth2.Config, error) {
-	if len(strings.TrimSpace(m.config.Tenant)) == 0 {
+	if strings.TrimSpace(m.config.Tenant) == "" {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("No Tenant specified for the `microsoft` oidc provider %s", m.config.ID))
 	}
 
@@ -50,7 +52,7 @@ func (m *ProviderMicrosoft) OAuth2(ctx context.Context) (*oauth2.Config, error) 
 	return m.oauth2ConfigFromEndpoint(ctx, endpoint), nil
 }
 
-func (m *ProviderMicrosoft) Claims(ctx context.Context, exchange *oauth2.Token, query url.Values) (*Claims, error) {
+func (m *ProviderMicrosoft) Claims(ctx context.Context, exchange *oauth2.Token, _ url.Values) (*Claims, error) {
 	raw, ok := exchange.Extra("id_token").(string)
 	if !ok || len(raw) == 0 {
 		return nil, errors.WithStack(ErrIDTokenMissing)
@@ -67,6 +69,7 @@ func (m *ProviderMicrosoft) Claims(ctx context.Context, exchange *oauth2.Token, 
 	}
 
 	issuer := "https://login.microsoftonline.com/" + unverifiedClaims.TenantID + "/v2.0"
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, m.reg.HTTPClient(ctx).HTTPClient)
 	p, err := gooidc.NewProvider(ctx, issuer)
 	if err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to initialize OpenID Connect Provider: %s", err))
@@ -87,8 +90,8 @@ func (m *ProviderMicrosoft) updateSubject(ctx context.Context, claims *Claims, e
 			return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 		}
 
-		client := m.reg.HTTPClient(ctx, httpx.ResilientClientWithClient(o.Client(ctx, exchange)))
-		req, err := retryablehttp.NewRequest("GET", "https://graph.microsoft.com/v1.0/me", nil)
+		ctx, client := httpx.SetOAuth2(ctx, m.reg.HTTPClient(ctx), o, exchange)
+		req, err := retryablehttp.NewRequestWithContext(ctx, "GET", "https://graph.microsoft.com/v1.0/me", nil)
 		if err != nil {
 			return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 		}
@@ -99,6 +102,10 @@ func (m *ProviderMicrosoft) updateSubject(ctx context.Context, claims *Claims, e
 		}
 		defer resp.Body.Close()
 
+		if err := logUpstreamError(m.reg.Logger(), resp); err != nil {
+			return nil, err
+		}
+
 		var user struct {
 			ID string `json:"id"`
 		}
@@ -107,6 +114,10 @@ func (m *ProviderMicrosoft) updateSubject(ctx context.Context, claims *Claims, e
 		}
 
 		claims.Subject = user.ID
+	}
+
+	if m.config.SubjectSource == "oid" {
+		claims.Subject = claims.Object
 	}
 
 	return claims, nil

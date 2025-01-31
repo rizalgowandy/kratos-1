@@ -1,9 +1,14 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package test
 
 import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/gofrs/uuid"
 
 	"github.com/ory/kratos/internal/testhelpers"
 
@@ -24,7 +29,7 @@ func TestPersister(ctx context.Context, p interface {
 	identity.PrivilegedPool
 }) func(t *testing.T) {
 	var createIdentity = func(t *testing.T) *identity.Identity {
-		id := identity.Identity{ID: x.NewUUID()}
+		id := identity.Identity{}
 		require.NoError(t, p.CreateIdentity(ctx, &id))
 		return &id
 	}
@@ -59,6 +64,7 @@ func TestPersister(ctx context.Context, p interface {
 			expected := createContainer(t)
 
 			require.NoError(t, p.SaveContinuitySession(ctx, &expected))
+			require.NotEqual(t, uuid.Nil, expected.ID)
 			require.NoError(t, p.DeleteContinuitySession(ctx, expected.ID))
 
 			_, err := p.GetContinuitySession(ctx, expected.ID)
@@ -91,6 +97,30 @@ func TestPersister(ctx context.Context, p interface {
 			t.Run("can not delete on another network", func(t *testing.T) {
 				_, p := testhelpers.NewNetwork(t, ctx, p)
 				err := p.DeleteContinuitySession(ctx, id)
+				require.ErrorIs(t, err, sqlcon.ErrNoRows)
+			})
+		})
+
+		t.Run("case=set expiry", func(t *testing.T) {
+			// Create a new continuity session
+			expected := createContainer(t)
+			require.NoError(t, p.SaveContinuitySession(ctx, &expected))
+
+			// Set the expiry of the continuity session
+			newExpiry := time.Now().Add(48 * time.Hour).UTC().Truncate(time.Second)
+			require.NoError(t, p.SetContinuitySessionExpiry(ctx, expected.ID, newExpiry))
+
+			// Retrieve the continuity session
+			actual, err := p.GetContinuitySession(ctx, expected.ID)
+			require.NoError(t, err)
+
+			// Check if the expiry has been updated
+			assert.EqualValues(t, newExpiry, actual.ExpiresAt)
+
+			t.Run("can not update on another network", func(t *testing.T) {
+				_, p := testhelpers.NewNetwork(t, ctx, p)
+				newExpiry := time.Now().Add(12 * time.Hour).UTC().Truncate(time.Second)
+				err := p.SetContinuitySessionExpiry(ctx, expected.ID, newExpiry)
 				require.ErrorIs(t, err, sqlcon.ErrNoRows)
 			})
 		})

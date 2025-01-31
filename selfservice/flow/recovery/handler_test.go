@@ -1,10 +1,13 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package recovery_test
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -34,8 +37,9 @@ func init() {
 }
 
 func TestHandlerRedirectOnAuthenticated(t *testing.T) {
+	ctx := context.Background()
 	conf, reg := internal.NewFastRegistryWithMocks(t)
-	conf.MustSet(config.ViperKeySelfServiceRecoveryEnabled, true)
+	conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryEnabled, true)
 
 	router := x.NewRouterPublic()
 	ts, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin())
@@ -44,13 +48,13 @@ func TestHandlerRedirectOnAuthenticated(t *testing.T) {
 	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/identity.schema.json")
 
 	t.Run("does redirect to default on authenticated request", func(t *testing.T) {
-		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router.Router, x.NewTestHTTPRequest(t, "GET", ts.URL+recovery.RouteInitBrowserFlow, nil))
+		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router.Router, testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+recovery.RouteInitBrowserFlow, nil))
 		assert.Contains(t, res.Request.URL.String(), redirTS.URL, "%+v", res)
 		assert.EqualValues(t, "already authenticated", string(body))
 	})
 
 	t.Run("does redirect to default on authenticated request", func(t *testing.T) {
-		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router.Router, x.NewTestHTTPRequest(t, "GET", ts.URL+recovery.RouteInitAPIFlow, nil))
+		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router.Router, testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+recovery.RouteInitAPIFlow, nil))
 		assert.Contains(t, res.Request.URL.String(), recovery.RouteInitAPIFlow)
 		assert.EqualValues(t, text.ErrIDAlreadyLoggedIn, gjson.GetBytes(body, "error.id").Str)
 		assertx.EqualAsJSON(t, recovery.ErrAlreadyLoggedIn, json.RawMessage(gjson.GetBytes(body, "error").Raw))
@@ -58,16 +62,19 @@ func TestHandlerRedirectOnAuthenticated(t *testing.T) {
 }
 
 func TestInitFlow(t *testing.T) {
+	ctx := context.Background()
 	conf, reg := internal.NewFastRegistryWithMocks(t)
-	conf.MustSet(config.ViperKeySelfServiceRecoveryEnabled, true)
-	conf.MustSet(config.ViperKeySelfServiceStrategyConfig+"."+recovery.StrategyRecoveryLinkName,
+	conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryEnabled, true)
+	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(recovery.RecoveryStrategyLink),
+		map[string]interface{}{"enabled": true})
+	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(recovery.RecoveryStrategyCode),
 		map[string]interface{}{"enabled": true})
 
 	router := x.NewRouterPublic()
 	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin())
 	recoveryTS := testhelpers.NewRecoveryUIFlowEchoServer(t, reg)
 
-	conf.MustSet(config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh")
+	conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh")
 	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/identity.schema.json")
 
 	assertion := func(body []byte, isForced, isApi bool) {
@@ -83,7 +90,7 @@ func TestInitFlow(t *testing.T) {
 		if isAPI {
 			route = recovery.RouteInitAPIFlow
 		}
-		req := x.NewTestHTTPRequest(t, "GET", publicTS.URL+route, nil)
+		req := testhelpers.NewTestHTTPRequest(t, "GET", publicTS.URL+route, nil)
 		if isSPA {
 			req.Header.Set("Accept", "application/json")
 		}
@@ -103,7 +110,7 @@ func TestInitFlow(t *testing.T) {
 		res, err := c.Get(publicTS.URL + route)
 		require.NoError(t, err)
 		defer res.Body.Close()
-		body, err := ioutil.ReadAll(res.Body)
+		body, err := io.ReadAll(res.Body)
 		require.NoError(t, err)
 		return res, body
 	}
@@ -111,14 +118,14 @@ func TestInitFlow(t *testing.T) {
 	initSPAFlow := func(t *testing.T, hc *http.Client, isSPA bool) (*http.Response, []byte) {
 		route := recovery.RouteInitBrowserFlow
 		c := publicTS.Client()
-		req := x.NewTestHTTPRequest(t, "GET", publicTS.URL+route, nil)
+		req := testhelpers.NewTestHTTPRequest(t, "GET", publicTS.URL+route, nil)
 		if isSPA {
 			req.Header.Set("Accept", "application/json")
 		}
 		res, err := c.Do(req)
 		require.NoError(t, err)
 		defer res.Body.Close()
-		body, err := ioutil.ReadAll(res.Body)
+		body, err := io.ReadAll(res.Body)
 		require.NoError(t, err)
 		return res, body
 	}
@@ -164,7 +171,7 @@ func TestInitFlow(t *testing.T) {
 		})
 
 		t.Run("case=relative redirect when self-service recovery ui is a relative URL", func(t *testing.T) {
-			reg.Config(context.Background()).MustSet(config.ViperKeySelfServiceRecoveryUI, "/recovery-ts")
+			reg.Config().MustSet(ctx, config.ViperKeySelfServiceRecoveryUI, "/recovery-ts")
 			assert.Regexp(
 				t,
 				"^/recovery-ts.*$",
@@ -185,17 +192,20 @@ func TestInitFlow(t *testing.T) {
 
 			res, err := c.Do(req)
 			require.NoError(t, err)
+			defer res.Body.Close()
 			// here we check that the redirect status is 303
 			require.Equal(t, http.StatusSeeOther, res.StatusCode)
-			defer res.Body.Close()
 		})
 	})
 }
 
 func TestGetFlow(t *testing.T) {
+	ctx := context.Background()
 	conf, reg := internal.NewFastRegistryWithMocks(t)
-	conf.MustSet(config.ViperKeySelfServiceRecoveryEnabled, true)
-	conf.MustSet(config.ViperKeySelfServiceStrategyConfig+"."+recovery.StrategyRecoveryLinkName,
+	conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryEnabled, true)
+	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(recovery.RecoveryStrategyLink),
+		map[string]interface{}{"enabled": true})
+	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(recovery.RecoveryStrategyCode),
 		map[string]interface{}{"enabled": true})
 	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/identity.schema.json")
 
@@ -205,18 +215,18 @@ func TestGetFlow(t *testing.T) {
 
 	setupRecoveryTS := func(t *testing.T, c *http.Client) *httptest.Server {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, err := w.Write(x.EasyGetBody(t, c, public.URL+recovery.RouteGetFlow+"?id="+r.URL.Query().Get("flow")))
+			_, err := w.Write(testhelpers.EasyGetBody(t, c, public.URL+recovery.RouteGetFlow+"?id="+r.URL.Query().Get("flow")))
 			require.NoError(t, err)
 		}))
 		t.Cleanup(ts.Close)
-		conf.MustSet(config.ViperKeySelfServiceRecoveryUI, ts.URL)
+		conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryUI, ts.URL)
 		return ts
 	}
 
 	t.Run("case=csrf cookie missing", func(t *testing.T) {
 		client := http.DefaultClient
 		setupRecoveryTS(t, client)
-		body := x.EasyGetBody(t, client, public.URL+recovery.RouteInitBrowserFlow)
+		body := testhelpers.EasyGetBody(t, client, public.URL+recovery.RouteInitBrowserFlow)
 
 		assert.EqualValues(t, x.ErrInvalidCSRFToken.ReasonField, gjson.GetBytes(body, "error.reason").String(), "%s", body)
 	})
@@ -224,7 +234,7 @@ func TestGetFlow(t *testing.T) {
 	t.Run("case=valid", func(t *testing.T) {
 		client := testhelpers.NewClientWithCookies(t)
 		setupRecoveryTS(t, client)
-		body := x.EasyGetBody(t, client, public.URL+recovery.RouteInitBrowserFlow)
+		body := testhelpers.EasyGetBody(t, client, public.URL+recovery.RouteInitBrowserFlow)
 		assert.NotEmpty(t, gjson.GetBytes(body, "ui.nodes.#(attributes.name==csrf_token).attributes.value").String(), "%s", body)
 		assert.NotEmpty(t, gjson.GetBytes(body, "id").String(), "%s", body)
 		assert.Empty(t, gjson.GetBytes(body, "headers").Value(), "%s", body)
@@ -235,7 +245,7 @@ func TestGetFlow(t *testing.T) {
 	t.Run("case=expired", func(t *testing.T) {
 		client := testhelpers.NewClientWithCookies(t)
 		setupRecoveryTS(t, client)
-		body := x.EasyGetBody(t, client, public.URL+recovery.RouteInitBrowserFlow)
+		body := testhelpers.EasyGetBody(t, client, public.URL+recovery.RouteInitBrowserFlow)
 
 		// Expire the flow
 		f, err := reg.RecoveryFlowPersister().GetRecoveryFlow(context.Background(), uuid.FromStringOrNil(gjson.GetBytes(body, "id").String()))
@@ -243,17 +253,17 @@ func TestGetFlow(t *testing.T) {
 		f.ExpiresAt = time.Now().Add(-time.Second)
 		require.NoError(t, reg.RecoveryFlowPersister().UpdateRecoveryFlow(context.Background(), f))
 
-		res, body := x.EasyGet(t, client, public.URL+recovery.RouteGetFlow+"?id="+f.ID.String())
+		res, body := testhelpers.EasyGet(t, client, public.URL+recovery.RouteGetFlow+"?id="+f.ID.String())
 		assert.EqualValues(t, http.StatusGone, res.StatusCode)
 		assert.Equal(t, public.URL+recovery.RouteInitBrowserFlow, gjson.GetBytes(body, "error.details.redirect_to").String(), "%s", body)
 	})
 
 	t.Run("case=expired with return_to", func(t *testing.T) {
 		returnTo := "https://www.ory.sh"
-		conf.MustSet(config.ViperKeyURLsAllowedReturnToDomains, []string{returnTo})
+		conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{returnTo})
 		client := testhelpers.NewClientWithCookies(t)
 		setupRecoveryTS(t, client)
-		body := x.EasyGetBody(t, client, public.URL+recovery.RouteInitBrowserFlow+"?return_to="+returnTo)
+		body := testhelpers.EasyGetBody(t, client, public.URL+recovery.RouteInitBrowserFlow+"?return_to="+returnTo)
 
 		// Expire the flow
 		f, err := reg.RecoveryFlowPersister().GetRecoveryFlow(context.Background(), uuid.FromStringOrNil(gjson.GetBytes(body, "id").String()))
@@ -263,13 +273,14 @@ func TestGetFlow(t *testing.T) {
 
 		// Retrieve the flow and verify that return_to is in the response
 		getURL := fmt.Sprintf("%s%s?id=%s&return_to=%s", public.URL, recovery.RouteGetFlow, f.ID, returnTo)
-		getBody := x.EasyGetBody(t, client, getURL)
+		getBody := testhelpers.EasyGetBody(t, client, getURL)
 		assert.Equal(t, gjson.GetBytes(getBody, "error.details.return_to").String(), returnTo)
 
 		// submit the flow but it is expired
 		u := public.URL + recovery.RouteSubmitFlow + "?flow=" + f.ID.String()
 		res, err := client.PostForm(u, url.Values{"email": {"email@ory.sh"}, "csrf_token": {f.CSRFToken}, "method": {"link"}})
-		resBody, err := ioutil.ReadAll(res.Body)
+		require.NoError(t, err)
+		resBody, err := io.ReadAll(res.Body)
 		require.NoError(t, err)
 		require.NoError(t, res.Body.Close())
 
@@ -282,7 +293,7 @@ func TestGetFlow(t *testing.T) {
 		client := testhelpers.NewClientWithCookies(t)
 		setupRecoveryTS(t, client)
 
-		res, _ := x.EasyGet(t, client, public.URL+recovery.RouteGetFlow+"?id="+x.NewUUID().String())
+		res, _ := testhelpers.EasyGet(t, client, public.URL+recovery.RouteGetFlow+"?id="+x.NewUUID().String())
 		assert.EqualValues(t, http.StatusNotFound, res.StatusCode)
 	})
 }

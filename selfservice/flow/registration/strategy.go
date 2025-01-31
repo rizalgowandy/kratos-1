@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package registration
 
 import (
@@ -48,7 +51,9 @@ func (s Strategies) RegisterPublicRoutes(r *x.RouterPublic) {
 	}
 }
 
+type StrategyFilter func(strategy Strategy) bool
+
 type StrategyProvider interface {
-	RegistrationStrategies(ctx context.Context) Strategies
+	RegistrationStrategies(ctx context.Context, filters ...StrategyFilter) Strategies
 	AllRegistrationStrategies() Strategies
 }

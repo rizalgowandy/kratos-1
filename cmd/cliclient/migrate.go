@@ -1,11 +1,17 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package cliclient
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
-	"os"
-	"strings"
+
+	"github.com/ory/x/popx"
+	"github.com/ory/x/servicelocatorx"
+
+	"github.com/pkg/errors"
+
+	"github.com/ory/x/contextx"
 
 	"github.com/ory/x/configx"
 
@@ -23,74 +29,74 @@ func NewMigrateHandler() *MigrateHandler {
 	return &MigrateHandler{}
 }
 
-func (h *MigrateHandler) MigrateSQL(cmd *cobra.Command, args []string) {
-	var d driver.Registry
-
+func (h *MigrateHandler) getPersister(cmd *cobra.Command, args []string, opts []driver.RegistryOption) (d driver.Registry, err error) {
 	if flagx.MustGetBool(cmd, "read-from-env") {
-		d = driver.NewWithoutInit(
+		d, err = driver.NewWithoutInit(
 			cmd.Context(),
 			cmd.ErrOrStderr(),
-			configx.WithFlags(cmd.Flags()),
-			configx.SkipValidation())
-		if len(d.Config(cmd.Context()).DSN()) == 0 {
+			servicelocatorx.NewOptions(),
+			nil,
+			[]configx.OptionModifier{
+				configx.WithFlags(cmd.Flags()),
+				configx.SkipValidation(),
+			})
+		if err != nil {
+			return nil, err
+		}
+		if len(d.Config().DSN(cmd.Context())) == 0 {
 			fmt.Println(cmd.UsageString())
 			fmt.Println("")
 			fmt.Println("When using flag -e, environment variable DSN must be set")
-			os.Exit(1)
-			return
+			return nil, cmdx.FailSilently(cmd)
 		}
 	} else {
 		if len(args) != 1 {
 			fmt.Println(cmd.UsageString())
-			os.Exit(1)
-			return
+			return nil, cmdx.FailSilently(cmd)
 		}
-		d = driver.NewWithoutInit(
+		d, err = driver.NewWithoutInit(
 			cmd.Context(),
 			cmd.ErrOrStderr(),
-			configx.WithFlags(cmd.Flags()),
-			configx.SkipValidation(),
-			configx.WithValue(config.ViperKeyDSN, args[0]))
-	}
-
-	err := d.Init(cmd.Context(), driver.SkipNetworkInit)
-	cmdx.Must(err, "An error occurred initializing migrations: %s", err)
-
-	var plan bytes.Buffer
-	statuses, err := d.Persister().MigrationStatus(cmd.Context())
-	cmdx.Must(err, "An error occurred planning migrations:%s \n-- Migration Plan --\n%s", err, statuses.Write(&plan))
-
-	if !flagx.MustGetBool(cmd, "yes") {
-		fmt.Println("The following migration is planned:")
-		fmt.Println("")
-		fmt.Printf("%s", plan.String())
-		fmt.Println("")
-		fmt.Println("To skip the next question use flag --yes (at your own risk).")
-		if !askForConfirmation("Do you wish to execute this migration plan?") {
-			fmt.Println("Migration aborted.")
-			return
+			servicelocatorx.NewOptions(),
+			nil,
+			[]configx.OptionModifier{
+				configx.WithFlags(cmd.Flags()),
+				configx.SkipValidation(),
+				configx.WithValue(config.ViperKeyDSN, args[0]),
+			})
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	err = d.Persister().MigrateUp(cmd.Context())
-	cmdx.Must(err, "An error occurred while connecting to SQL: %s", err)
-	fmt.Println("Successfully applied SQL migrations!")
+	err = d.Init(cmd.Context(), &contextx.Default{}, append(opts, driver.SkipNetworkInit)...)
+	if err != nil {
+		return nil, errors.Wrap(err, "an error occurred initializing migrations")
+	}
+
+	return d, nil
 }
 
-func askForConfirmation(s string) bool {
-	reader := bufio.NewReader(os.Stdin)
-
-	for {
-		fmt.Printf("%s [y/n]: ", s)
-
-		response, err := reader.ReadString('\n')
-		cmdx.Must(err, "%s", err)
-
-		response = strings.ToLower(strings.TrimSpace(response))
-		if response == "y" || response == "yes" {
-			return true
-		} else if response == "n" || response == "no" {
-			return false
-		}
+func (h *MigrateHandler) MigrateSQLDown(cmd *cobra.Command, args []string, opts ...driver.RegistryOption) error {
+	p, err := h.getPersister(cmd, args, opts)
+	if err != nil {
+		return err
 	}
+	return popx.MigrateSQLDown(cmd, p.Persister())
+}
+
+func (h *MigrateHandler) MigrateSQLStatus(cmd *cobra.Command, args []string, opts ...driver.RegistryOption) error {
+	p, err := h.getPersister(cmd, args, opts)
+	if err != nil {
+		return err
+	}
+	return popx.MigrateStatus(cmd, p.Persister())
+}
+
+func (h *MigrateHandler) MigrateSQLUp(cmd *cobra.Command, args []string, opts ...driver.RegistryOption) error {
+	p, err := h.getPersister(cmd, args, opts)
+	if err != nil {
+		return err
+	}
+	return popx.MigrateSQLUp(cmd, p.Persister())
 }

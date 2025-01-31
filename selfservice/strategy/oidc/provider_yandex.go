@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
@@ -14,15 +17,17 @@ import (
 	"github.com/ory/herodot"
 )
 
+var _ OAuth2Provider = (*ProviderYandex)(nil)
+
 type ProviderYandex struct {
 	config *Configuration
-	reg    dependencies
+	reg    Dependencies
 }
 
 func NewProviderYandex(
 	config *Configuration,
-	reg dependencies,
-) *ProviderYandex {
+	reg Dependencies,
+) Provider {
 	return &ProviderYandex{
 		config: config,
 		reg:    reg,
@@ -42,7 +47,7 @@ func (g *ProviderYandex) oauth2(ctx context.Context) *oauth2.Config {
 			TokenURL: "https://oauth.yandex.com/token",
 		},
 		Scopes:      g.config.Scope,
-		RedirectURL: g.config.Redir(g.reg.Config(ctx).OIDCRedirectURIBase()),
+		RedirectURL: g.config.Redir(g.reg.Config().OIDCRedirectURIBase(ctx)),
 	}
 }
 
@@ -60,8 +65,8 @@ func (g *ProviderYandex) Claims(ctx context.Context, exchange *oauth2.Token, que
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 
-	client := g.reg.HTTPClient(ctx, httpx.ResilientClientDisallowInternalIPs(), httpx.ResilientClientWithClient(o.Client(ctx, exchange)))
-	req, err := retryablehttp.NewRequest("GET", "https://login.yandex.ru/info?format=json&oauth_token="+exchange.AccessToken, nil)
+	ctx, client := httpx.SetOAuth2(ctx, g.reg.HTTPClient(ctx), o, exchange)
+	req, err := retryablehttp.NewRequestWithContext(ctx, "GET", "https://login.yandex.ru/info?format=json&oauth_token="+exchange.AccessToken, nil)
 	if err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
@@ -71,6 +76,10 @@ func (g *ProviderYandex) Claims(ctx context.Context, exchange *oauth2.Token, que
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 	defer resp.Body.Close()
+
+	if err := logUpstreamError(g.reg.Logger(), resp); err != nil {
+		return nil, err
+	}
 
 	var user struct {
 		Id           string `json:"id,omitempty"`

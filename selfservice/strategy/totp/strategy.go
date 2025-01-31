@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package totp
 
 import (
@@ -21,15 +24,18 @@ import (
 	"github.com/ory/x/decoderx"
 )
 
-var _ login.Strategy = new(Strategy)
-var _ settings.Strategy = new(Strategy)
-var _ identity.ActiveCredentialsCounter = new(Strategy)
+var (
+	_ login.Strategy                    = new(Strategy)
+	_ settings.Strategy                 = new(Strategy)
+	_ identity.ActiveCredentialsCounter = new(Strategy)
+)
 
-type registrationStrategyDependencies interface {
+type totpStrategyDependencies interface {
 	x.LoggingProvider
 	x.WriterProvider
 	x.CSRFTokenGeneratorProvider
 	x.CSRFProvider
+	x.TracingProvider
 
 	config.Provider
 
@@ -64,31 +70,31 @@ type registrationStrategyDependencies interface {
 }
 
 type Strategy struct {
-	d  registrationStrategyDependencies
+	d  totpStrategyDependencies
 	hd *decoderx.HTTP
 }
 
-func NewStrategy(d registrationStrategyDependencies) *Strategy {
+func NewStrategy(d any) *Strategy {
 	return &Strategy{
-		d:  d,
+		d:  d.(totpStrategyDependencies),
 		hd: decoderx.NewHTTP(),
 	}
 }
 
-func (s *Strategy) CountActiveFirstFactorCredentials(cc map[identity.CredentialsType]identity.Credentials) (count int, err error) {
+func (s *Strategy) CountActiveFirstFactorCredentials(_ context.Context, _ map[identity.CredentialsType]identity.Credentials) (count int, err error) {
 	return 0, nil
 }
 
-func (s *Strategy) CountActiveMultiFactorCredentials(cc map[identity.CredentialsType]identity.Credentials) (count int, err error) {
+func (s *Strategy) CountActiveMultiFactorCredentials(_ context.Context, cc map[identity.CredentialsType]identity.Credentials) (count int, err error) {
 	for _, c := range cc {
 		if c.Type == s.ID() && len(c.Config) > 0 {
-			var conf CredentialsConfig
+			var conf identity.CredentialsTOTPConfig
 			if err = json.Unmarshal(c.Config, &conf); err != nil {
 				return 0, errors.WithStack(err)
 			}
 
 			_, err := otp.NewKeyFromURL(conf.TOTPURL)
-			if len(c.Identifiers) > 0 && len(c.Identifiers[0]) > 0 && len(conf.TOTPURL) > 0 && err == nil {
+			if len(conf.TOTPURL) > 0 && err == nil {
 				count++
 			}
 		}

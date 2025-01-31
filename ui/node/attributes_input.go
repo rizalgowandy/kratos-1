@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package node
 
 import (
@@ -10,7 +13,7 @@ import (
 
 const DisableFormField = "disableFormField"
 
-func toFormType(n string, i interface{}) InputAttributeType {
+func toFormType(n string, i interface{}) UiNodeInputAttributeType {
 	switch n {
 	case x.CSRFTokenName:
 		return InputAttributeTypeHidden
@@ -33,6 +36,12 @@ type InputAttributesModifiers []InputAttributesModifier
 
 func WithRequiredInputAttribute(a *InputAttributes) {
 	a.Required = true
+}
+
+func WithMaxLengthInputAttribute(maxLength int) func(a *InputAttributes) {
+	return func(a *InputAttributes) {
+		a.MaxLength = maxLength
+	}
 }
 
 func WithInputAttributes(f func(a *InputAttributes)) func(a *InputAttributes) {
@@ -67,12 +76,6 @@ func applyImageAttributes(opts ImageAttributesModifiers, attributes *ImageAttrib
 type ScriptAttributesModifier func(attributes *ScriptAttributes)
 type ScriptAttributesModifiers []ScriptAttributesModifier
 
-func WithScriptAttributes(f func(a *ScriptAttributes)) func(a *ScriptAttributes) {
-	return func(a *ScriptAttributes) {
-		f(a)
-	}
-}
-
 func applyScriptAttributes(opts ScriptAttributesModifiers, attributes *ScriptAttributes) *ScriptAttributes {
 	for _, f := range opts {
 		f(attributes)
@@ -89,7 +92,7 @@ func NewInputFieldFromJSON(name string, value interface{}, group UiNodeGroup, op
 	}
 }
 
-func NewInputField(name string, value interface{}, group UiNodeGroup, inputType InputAttributeType, opts ...InputAttributesModifier) *Node {
+func NewInputField(name string, value interface{}, group UiNodeGroup, inputType UiNodeInputAttributeType, opts ...InputAttributesModifier) *Node {
 	return &Node{
 		Type:       Input,
 		Group:      group,

@@ -1,34 +1,37 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package schema
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"strings"
-
-	"github.com/ory/x/urlx"
-
-	"github.com/ory/kratos/driver/config"
 
 	"github.com/julienschmidt/httprouter"
 	"github.com/pkg/errors"
 
 	"github.com/ory/herodot"
-
+	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/otelx"
+	"github.com/ory/x/pagination/migrationpagination"
 )
 
 type (
 	handlerDependencies interface {
 		x.WriterProvider
 		x.LoggingProvider
-		IdentityTraitsProvider
+		IdentitySchemaProvider
 		x.CSRFProvider
 		config.Provider
+		x.TracingProvider
+		x.HTTPClientProvider
 	}
 	Handler struct {
 		r handlerDependencies
@@ -49,9 +52,9 @@ func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 		"/"+SchemasPath+"/*",
 		x.AdminPrefix+"/"+SchemasPath+"/*",
 	)
-	public.GET(fmt.Sprintf("/%s/:id", SchemasPath), h.getByID)
+	public.GET(fmt.Sprintf("/%s/:id", SchemasPath), h.getIdentitySchema)
 	public.GET(fmt.Sprintf("/%s", SchemasPath), h.getAll)
-	public.GET(fmt.Sprintf("%s/%s/:id", x.AdminPrefix, SchemasPath), h.getByID)
+	public.GET(fmt.Sprintf("%s/%s/:id", x.AdminPrefix, SchemasPath), h.getIdentitySchema)
 	public.GET(fmt.Sprintf("%s/%s", x.AdminPrefix, SchemasPath), h.getAll)
 }
 
@@ -62,13 +65,28 @@ func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
 
 // Raw JSON Schema
 //
-// swagger:model jsonSchema
-// nolint:deadcode,unused
-type jsonSchema json.RawMessage
+// swagger:model identitySchema
+//
+//nolint:deadcode,unused
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
+type identitySchema json.RawMessage
 
-// nolint:deadcode,unused
-// swagger:parameters getJsonSchema
-type getJsonSchema struct {
+func (m identitySchema) MarshalJSON() ([]byte, error) {
+	return json.RawMessage(m).MarshalJSON()
+}
+
+func (m *identitySchema) UnmarshalJSON(data []byte) error {
+	mm := json.RawMessage(*m)
+	return mm.UnmarshalJSON(data)
+}
+
+// Get Identity JSON Schema Response
+//
+// swagger:parameters getIdentitySchema
+//
+//nolint:deadcode,unused
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
+type getIdentitySchema struct {
 	// ID must be set to the ID of schema you want to get
 	//
 	// required: true
@@ -76,21 +94,26 @@ type getJsonSchema struct {
 	ID string `json:"id"`
 }
 
-// swagger:route GET /schemas/{id} v0alpha2 getJsonSchema
+// swagger:route GET /schemas/{id} identity getIdentitySchema
 //
-// Get a JSON Schema
+// # Get Identity JSON Schema
 //
-//     Produces:
-//     - application/json
+// Return a specific identity schema.
 //
-//     Schemes: http, https
+//	Produces:
+//	- application/json
 //
-//     Responses:
-//       200: jsonSchema
-//       404: jsonError
-//       500: jsonError
-func (h *Handler) getByID(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	ss, err := h.r.IdentityTraitsSchemas(r.Context())
+//	Schemes: http, https
+//
+//	Responses:
+//	  200: identitySchema
+//	  404: errorGeneric
+//	  default: errorGeneric
+func (h *Handler) getIdentitySchema(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	ctx, span := h.r.Tracer(r.Context()).Tracer().Start(r.Context(), "schema.Handler.getIdentitySchema")
+	defer span.End()
+
+	ss, err := h.r.IdentityTraitsSchemas(ctx)
 	if err != nil {
 		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrInternalServerError.WithWrap(err)))
 		return
@@ -111,7 +134,7 @@ func (h *Handler) getByID(w http.ResponseWriter, r *http.Request, ps httprouter.
 		}
 	}
 
-	src, err := ReadSchema(s)
+	src, err := h.ReadSchema(ctx, s)
 	if err != nil {
 		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("The file for this JSON Schema ID could not be found or opened. This is a configuration issue.").WithDebugf("%+v", err)))
 		return
@@ -125,38 +148,62 @@ func (h *Handler) getByID(w http.ResponseWriter, r *http.Request, ps httprouter.
 	}
 }
 
-// Raw identity Schema list
+// List of Identity JSON Schemas
 //
 // swagger:model identitySchemas
-type IdentitySchemas []identitySchema
+type IdentitySchemas []identitySchemaContainer
 
-// swagger:model identitySchema
-type identitySchema struct {
+// An Identity JSON Schema Container
+//
+// swagger:model identitySchemaContainer
+type identitySchemaContainer struct {
 	// The ID of the Identity JSON Schema
 	ID string `json:"id"`
 	// The actual Identity JSON Schema
 	Schema json.RawMessage `json:"schema"`
 }
 
-// nolint:deadcode,unused
+// List Identity JSON Schemas Response
+//
 // swagger:parameters listIdentitySchemas
+//
+//nolint:deadcode,unused
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
 type listIdentitySchemas struct {
-	x.PaginationParams
+	migrationpagination.RequestParameters
 }
 
-// swagger:route GET /schemas v0alpha2 listIdentitySchemas
+// List Identity JSON Schemas Response
 //
-// Get all Identity Schemas
+// swagger:response identitySchemas
 //
-//     Produces:
-//     - application/json
+//nolint:deadcode,unused
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
+type identitySchemasResponse struct {
+	migrationpagination.ResponseHeaderAnnotation
+
+	// in: body
+	Body IdentitySchemas
+}
+
+// swagger:route GET /schemas identity listIdentitySchemas
 //
-//     Schemes: http, https
+// # Get all Identity Schemas
 //
-//     Responses:
-//       200: identitySchemas
-//       500: jsonError
+// Returns a list of all identity schemas currently in use.
+//
+//	Produces:
+//	- application/json
+//
+//	Schemes: http, https
+//
+//	Responses:
+//	  200: identitySchemas
+//	  default: errorGeneric
 func (h *Handler) getAll(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	ctx, span := h.r.Tracer(r.Context()).Tracer().Start(r.Context(), "schema.Handler.getAll")
+	defer span.End()
+
 	page, itemsPerPage := x.ParsePagination(r)
 
 	allSchemas, err := h.r.IdentityTraitsSchemas(r.Context())
@@ -170,45 +217,48 @@ func (h *Handler) getAll(w http.ResponseWriter, r *http.Request, ps httprouter.P
 	var ss IdentitySchemas
 	for k := range schemas {
 		schema := schemas[k]
-		src, err := ReadSchema(&schema)
+		src, err := h.ReadSchema(ctx, &schema)
 		if err != nil {
 			h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("The file for this JSON Schema ID could not be found or opened. This is a configuration issue.").WithDebugf("%+v", err)))
 			return
 		}
 
-		raw, err := ioutil.ReadAll(src)
+		raw, err := io.ReadAll(io.LimitReader(src, 1024*1024))
 		_ = src.Close()
 		if err != nil {
 			h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("The file for this JSON Schema ID could not be found or opened. This is a configuration issue.").WithDebugf("%+v", err)))
 			return
 		}
 
-		ss = append(ss, identitySchema{
+		ss = append(ss, identitySchemaContainer{
 			ID:     schema.ID,
 			Schema: raw,
 		})
 	}
 
-	x.PaginationHeader(w, urlx.AppendPaths(h.r.Config(r.Context()).SelfPublicURL(), fmt.Sprintf("/%s", SchemasPath)), int64(total), page, itemsPerPage)
+	x.PaginationHeader(w, *r.URL, int64(total), page, itemsPerPage)
 	h.r.Writer().Write(w, r, ss)
 }
 
-func ReadSchema(schema *Schema) (src io.ReadCloser, err error) {
+func (h *Handler) ReadSchema(ctx context.Context, schema *Schema) (src io.ReadCloser, err error) {
+	ctx, span := h.r.Tracer(ctx).Tracer().Start(ctx, "schema.Handler.ReadSchema")
+	defer otelx.End(span, &err)
+
 	if schema.URL.Scheme == "file" {
 		src, err = os.Open(schema.URL.Host + schema.URL.Path)
 		if err != nil {
-			return nil, errors.WithStack(err)
+			return nil, errors.WithStack(herodot.ErrInternalServerError.WithWrap(err).WithReason("Unable to fetch identity schema."))
 		}
 	} else if schema.URL.Scheme == "base64" {
 		data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(schema.RawURL, "base64://"))
 		if err != nil {
-			return nil, errors.WithStack(err)
+			return nil, errors.WithStack(herodot.ErrInternalServerError.WithWrap(err).WithReason("Unable to fetch identity schema."))
 		}
 		src = io.NopCloser(strings.NewReader(string(data)))
 	} else {
-		resp, err := http.Get(schema.URL.String())
+		resp, err := h.r.HTTPClient(ctx).Get(schema.URL.String())
 		if err != nil {
-			return nil, errors.WithStack(err)
+			return nil, errors.WithStack(herodot.ErrInternalServerError.WithWrap(err).WithReason("Unable to fetch identity schema."))
 		}
 		src = resp.Body
 	}

@@ -1,15 +1,19 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package testhelpers
 
 import (
 	"context"
-	"io/ioutil"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"testing"
 	"time"
 
-	"github.com/bxcodec/faker/v3"
-	"github.com/google/uuid"
+	"github.com/go-faker/faker/v4"
+	"github.com/gofrs/uuid"
 	"github.com/julienschmidt/httprouter"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
@@ -23,6 +27,7 @@ import (
 
 type mockDeps interface {
 	identity.PrivilegedPoolProvider
+	identity.ManagementProvider
 	session.ManagementProvider
 	session.PersistenceProvider
 	config.Provider
@@ -31,33 +36,30 @@ type mockDeps interface {
 func MockSetSession(t *testing.T, reg mockDeps, conf *config.Config) httprouter.Handle {
 	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 		i := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
-		require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), i))
+		i.NID = uuid.Must(uuid.NewV4())
+		require.NoError(t, i.SetCredentialsWithConfig(
+			identity.CredentialsTypePassword,
+			identity.Credentials{
+				Type:        identity.CredentialsTypePassword,
+				Identifiers: []string{faker.Email()},
+			},
+			json.RawMessage(`{"hashed_password":"$"}`)))
+		require.NoError(t, reg.IdentityManager().Create(context.Background(), i))
 
 		MockSetSessionWithIdentity(t, reg, conf, i)(w, r, ps)
 	}
 }
 
-func MockSetSessionWithIdentity(t *testing.T, reg mockDeps, conf *config.Config, i *identity.Identity) httprouter.Handle {
+func MockSetSessionWithIdentity(t *testing.T, reg mockDeps, _ *config.Config, i *identity.Identity) httprouter.Handle {
 	return func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-		activeSession, _ := session.NewActiveSession(i, conf, time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+		activeSession, err := NewActiveSession(r, reg, i, time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+		require.NoError(t, err)
 		if aal := r.URL.Query().Get("set_aal"); len(aal) > 0 {
 			activeSession.AuthenticatorAssuranceLevel = identity.AuthenticatorAssuranceLevel(aal)
 		}
 		require.NoError(t, reg.SessionManager().UpsertAndIssueCookie(context.Background(), w, r, activeSession))
 
 		w.WriteHeader(http.StatusOK)
-	}
-}
-
-func MockGetSession(t *testing.T, reg mockDeps) httprouter.Handle {
-	return func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-		_, err := reg.SessionManager().FetchFromRequest(r.Context(), r)
-		if r.URL.Query().Get("has") == "yes" {
-			require.NoError(t, err)
-		} else {
-			require.Error(t, err)
-		}
-		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
@@ -70,7 +72,7 @@ func MockMakeAuthenticatedRequestWithClient(t *testing.T, reg mockDeps, conf *co
 }
 
 func MockMakeAuthenticatedRequestWithClientAndID(t *testing.T, reg mockDeps, conf *config.Config, router *httprouter.Router, req *http.Request, client *http.Client, id *identity.Identity) ([]byte, *http.Response) {
-	set := "/" + uuid.New().String() + "/set"
+	set := "/" + uuid.Must(uuid.NewV4()).String() + "/set"
 	if id == nil {
 		router.GET(set, MockSetSession(t, reg, conf))
 	} else {
@@ -82,7 +84,7 @@ func MockMakeAuthenticatedRequestWithClientAndID(t *testing.T, reg mockDeps, con
 	res, err := client.Do(req)
 	require.NoError(t, errors.WithStack(err))
 
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	require.NoError(t, errors.WithStack(err))
 
 	require.NoError(t, res.Body.Close())
@@ -143,8 +145,9 @@ func MockSessionCreateHandlerWithIdentityAndAMR(t *testing.T, reg mockDeps, i *i
 	}
 	sess.SetAuthenticatorAssuranceLevel()
 
-	if _, err := reg.Config(context.Background()).DefaultIdentityTraitsSchemaURL(); err != nil {
-		SetDefaultIdentitySchema(reg.Config(context.Background()), "file://./stub/fake-session.schema.json")
+	ctx := context.Background()
+	if _, err := reg.Config().DefaultIdentityTraitsSchemaURL(ctx); err != nil {
+		SetDefaultIdentitySchema(reg.Config(), "file://./stub/fake-session.schema.json")
 	}
 
 	require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), i))
