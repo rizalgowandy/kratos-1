@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package testhelpers
 
 import (
@@ -6,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
 
 	"github.com/ory/nosurf"
 
@@ -25,7 +30,7 @@ type SessionLifespanProvider struct {
 	e time.Duration
 }
 
-func (p *SessionLifespanProvider) SessionLifespan() time.Duration {
+func (p *SessionLifespanProvider) SessionLifespan(context.Context) time.Duration {
 	return p.e
 }
 
@@ -39,24 +44,25 @@ func NewSessionClient(t *testing.T, u string) *http.Client {
 	return c
 }
 
-func maybePersistSession(t *testing.T, reg *driver.RegistryDefault, sess *session.Session) {
-	id, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(context.Background(), sess.Identity.ID)
+func maybePersistSession(t *testing.T, ctx context.Context, reg *driver.RegistryDefault, sess *session.Session) {
+	id, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, sess.Identity.ID)
 	if err != nil {
-		require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), sess.Identity))
-		id, err = reg.PrivilegedIdentityPool().GetIdentityConfidential(context.Background(), sess.Identity.ID)
+		require.NoError(t, sess.Identity.SetAvailableAAL(ctx, reg.IdentityManager()))
+		require.NoError(t, reg.IdentityManager().Create(ctx, sess.Identity))
+		id, err = reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, sess.Identity.ID)
 		require.NoError(t, err)
 	}
 	sess.Identity = id
 	sess.IdentityID = id.ID
 
-	require.NoError(t, err, reg.SessionPersister().UpsertSession(context.Background(), sess))
+	require.NoError(t, err, reg.SessionPersister().UpsertSession(ctx, sess))
 }
 
-func NewHTTPClientWithSessionCookie(t *testing.T, reg *driver.RegistryDefault, sess *session.Session) *http.Client {
-	maybePersistSession(t, reg, sess)
+func NewHTTPClientWithSessionCookie(t *testing.T, ctx context.Context, reg *driver.RegistryDefault, sess *session.Session) *http.Client {
+	maybePersistSession(t, ctx, reg, sess)
 
 	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.NoError(t, reg.SessionManager().IssueCookie(context.Background(), w, r, sess))
+		require.NoError(t, reg.SessionManager().IssueCookie(ctx, w, r, sess))
 	})
 
 	if _, ok := reg.CSRFHandler().(*nosurf.CSRFHandler); ok {
@@ -71,11 +77,11 @@ func NewHTTPClientWithSessionCookie(t *testing.T, reg *driver.RegistryDefault, s
 	return c
 }
 
-func NewHTTPClientWithSessionCookieLocalhost(t *testing.T, reg *driver.RegistryDefault, sess *session.Session) *http.Client {
-	maybePersistSession(t, reg, sess)
+func NewHTTPClientWithSessionCookieLocalhost(t *testing.T, ctx context.Context, reg *driver.RegistryDefault, sess *session.Session) *http.Client {
+	maybePersistSession(t, ctx, reg, sess)
 
 	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.NoError(t, reg.SessionManager().IssueCookie(context.Background(), w, r, sess))
+		require.NoError(t, reg.SessionManager().IssueCookie(ctx, w, r, sess))
 	})
 
 	if _, ok := reg.CSRFHandler().(*nosurf.CSRFHandler); ok {
@@ -92,11 +98,11 @@ func NewHTTPClientWithSessionCookieLocalhost(t *testing.T, reg *driver.RegistryD
 	return c
 }
 
-func NewNoRedirectHTTPClientWithSessionCookie(t *testing.T, reg *driver.RegistryDefault, sess *session.Session) *http.Client {
-	maybePersistSession(t, reg, sess)
+func NewNoRedirectHTTPClientWithSessionCookie(t *testing.T, ctx context.Context, reg *driver.RegistryDefault, sess *session.Session) *http.Client {
+	maybePersistSession(t, ctx, reg, sess)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.NoError(t, reg.SessionManager().IssueCookie(context.Background(), w, r, sess))
+		require.NoError(t, reg.SessionManager().IssueCookie(ctx, w, r, sess))
 	}))
 	defer ts.Close()
 
@@ -126,77 +132,107 @@ func (ct *TransportWithLogger) RoundTrip(req *http.Request) (*http.Response, err
 	return ct.RoundTripper.RoundTrip(req)
 }
 
-func NewHTTPClientWithSessionToken(t *testing.T, reg *driver.RegistryDefault, sess *session.Session) *http.Client {
-	maybePersistSession(t, reg, sess)
+func NewHTTPClientWithSessionToken(t *testing.T, ctx context.Context, reg *driver.RegistryDefault, sess *session.Session) *http.Client {
+	maybePersistSession(t, ctx, reg, sess)
 
 	return &http.Client{
-		Transport: x.NewTransportWithHeader(http.Header{
+		Transport: NewTransportWithHeader(t, http.Header{
 			"Authorization": {"Bearer " + sess.Token},
 		}),
 	}
 }
 
-func NewHTTPClientWithArbitrarySessionToken(t *testing.T, reg *driver.RegistryDefault) *http.Client {
-	s, err := session.NewActiveSession(
-		&identity.Identity{ID: x.NewUUID(), State: identity.StateActive},
-		NewSessionLifespanProvider(time.Hour),
-		time.Now(),
-		identity.CredentialsTypePassword,
-		identity.AuthenticatorAssuranceLevel1,
-	)
-	require.NoError(t, err, "Could not initialize session from identity.")
-
-	return NewHTTPClientWithSessionToken(t, reg, s)
+func NewHTTPClientWithArbitrarySessionToken(t *testing.T, ctx context.Context, reg *driver.RegistryDefault) *http.Client {
+	return NewHTTPClientWithArbitrarySessionTokenAndTraits(t, ctx, reg, nil)
 }
 
-func NewHTTPClientWithArbitrarySessionCookie(t *testing.T, reg *driver.RegistryDefault) *http.Client {
-	s, err := session.NewActiveSession(
-		&identity.Identity{ID: x.NewUUID(), State: identity.StateActive},
-		NewSessionLifespanProvider(time.Hour),
+func NewHTTPClientWithArbitrarySessionTokenAndTraits(t *testing.T, ctx context.Context, reg *driver.RegistryDefault, traits identity.Traits) *http.Client {
+	req := NewTestHTTPRequest(t, "GET", "/sessions/whoami", nil).WithContext(confighelpers.WithConfigValue(ctx, "session.lifespan", time.Hour))
+	s, err := NewActiveSession(req, reg,
+		&identity.Identity{ID: x.NewUUID(), State: identity.StateActive, Traits: traits, NID: x.NewUUID(), SchemaID: "default"},
 		time.Now(),
 		identity.CredentialsTypePassword,
 		identity.AuthenticatorAssuranceLevel1,
 	)
 	require.NoError(t, err, "Could not initialize session from identity.")
 
-	return NewHTTPClientWithSessionCookie(t, reg, s)
+	return NewHTTPClientWithSessionToken(t, ctx, reg, s)
 }
 
-func NewNoRedirectHTTPClientWithArbitrarySessionCookie(t *testing.T, reg *driver.RegistryDefault) *http.Client {
-	s, err := session.NewActiveSession(
-		&identity.Identity{ID: x.NewUUID(), State: identity.StateActive},
-		NewSessionLifespanProvider(time.Hour),
+func NewHTTPClientWithArbitrarySessionCookie(t *testing.T, ctx context.Context, reg *driver.RegistryDefault) *http.Client {
+	req := NewTestHTTPRequest(t, "GET", "/sessions/whoami", nil)
+	req = req.WithContext(confighelpers.WithConfigValue(ctx, "session.lifespan", time.Hour))
+	id := x.NewUUID()
+	s, err := NewActiveSession(req, reg,
+		&identity.Identity{ID: id, State: identity.StateActive, Traits: []byte("{}"), Credentials: map[identity.CredentialsType]identity.Credentials{
+			identity.CredentialsTypePassword: {Type: "password", Identifiers: []string{id.String()}, Config: []byte(`{"hashed_password":"$2a$04$zvZz1zV"}`)},
+		}},
 		time.Now(),
 		identity.CredentialsTypePassword,
 		identity.AuthenticatorAssuranceLevel1,
 	)
 	require.NoError(t, err, "Could not initialize session from identity.")
 
-	return NewNoRedirectHTTPClientWithSessionCookie(t, reg, s)
+	return NewHTTPClientWithSessionCookie(t, ctx, reg, s)
 }
 
-func NewHTTPClientWithIdentitySessionCookie(t *testing.T, reg *driver.RegistryDefault, id *identity.Identity) *http.Client {
-	s, err := session.NewActiveSession(id,
-		NewSessionLifespanProvider(time.Hour),
+func NewNoRedirectHTTPClientWithArbitrarySessionCookie(t *testing.T, ctx context.Context, reg *driver.RegistryDefault) *http.Client {
+	req := NewTestHTTPRequest(t, "GET", "/sessions/whoami", nil)
+	req = req.WithContext(confighelpers.WithConfigValue(ctx, "session.lifespan", time.Hour))
+	id := x.NewUUID()
+	s, err := NewActiveSession(req, reg,
+		&identity.Identity{ID: id, State: identity.StateActive,
+			Credentials: map[identity.CredentialsType]identity.Credentials{
+				identity.CredentialsTypePassword: {Type: "password", Identifiers: []string{id.String()}, Config: []byte(`{"hashed_password":"$2a$04$zvZz1zV"}`)},
+			}},
 		time.Now(),
 		identity.CredentialsTypePassword,
 		identity.AuthenticatorAssuranceLevel1,
 	)
 	require.NoError(t, err, "Could not initialize session from identity.")
 
-	return NewHTTPClientWithSessionCookie(t, reg, s)
+	return NewNoRedirectHTTPClientWithSessionCookie(t, ctx, reg, s)
 }
 
-func NewHTTPClientWithIdentitySessionToken(t *testing.T, reg *driver.RegistryDefault, id *identity.Identity) *http.Client {
-	s, err := session.NewActiveSession(id,
-		NewSessionLifespanProvider(time.Hour),
+func NewHTTPClientWithIdentitySessionCookie(t *testing.T, ctx context.Context, reg *driver.RegistryDefault, id *identity.Identity) *http.Client {
+	req := NewTestHTTPRequest(t, "GET", "/sessions/whoami", nil)
+	req = req.WithContext(confighelpers.WithConfigValue(ctx, "session.lifespan", time.Hour))
+	s, err := NewActiveSession(req, reg,
+		id,
 		time.Now(),
 		identity.CredentialsTypePassword,
 		identity.AuthenticatorAssuranceLevel1,
 	)
 	require.NoError(t, err, "Could not initialize session from identity.")
 
-	return NewHTTPClientWithSessionToken(t, reg, s)
+	return NewHTTPClientWithSessionCookie(t, ctx, reg, s)
+}
+
+func NewHTTPClientWithIdentitySessionCookieLocalhost(t *testing.T, ctx context.Context, reg *driver.RegistryDefault, id *identity.Identity) *http.Client {
+	req := NewTestHTTPRequest(t, "GET", "/sessions/whoami", nil)
+	s, err := NewActiveSession(req, reg,
+		id,
+		time.Now(),
+		identity.CredentialsTypePassword,
+		identity.AuthenticatorAssuranceLevel1,
+	)
+	require.NoError(t, err, "Could not initialize session from identity.")
+
+	return NewHTTPClientWithSessionCookieLocalhost(t, ctx, reg, s)
+}
+
+func NewHTTPClientWithIdentitySessionToken(t *testing.T, ctx context.Context, reg *driver.RegistryDefault, id *identity.Identity) *http.Client {
+	req := NewTestHTTPRequest(t, "GET", "/sessions/whoami", nil)
+	req = req.WithContext(confighelpers.WithConfigValue(ctx, "session.lifespan", time.Hour))
+	s, err := NewActiveSession(req, reg,
+		id,
+		time.Now(),
+		identity.CredentialsTypePassword,
+		identity.AuthenticatorAssuranceLevel1,
+	)
+	require.NoError(t, err, "Could not initialize session from identity.")
+
+	return NewHTTPClientWithSessionToken(t, ctx, reg, s)
 }
 
 func EnsureAAL(t *testing.T, c *http.Client, ts *httptest.Server, aal string, methods ...string) {
@@ -209,4 +245,48 @@ func EnsureAAL(t *testing.T, c *http.Client, ts *httptest.Server, aal string, me
 		assert.EqualValues(t, method, gjson.GetBytes(sess, "authentication_methods.#(method=="+method+").method").String())
 	}
 	assert.Len(t, gjson.GetBytes(sess, "authentication_methods").Array(), 1+len(methods))
+}
+
+func NewAuthorizedTransport(t *testing.T, ctx context.Context, reg *driver.RegistryDefault, sess *session.Session) *TransportWithHeader {
+	maybePersistSession(t, ctx, reg, sess)
+
+	return NewTransportWithHeader(t, http.Header{
+		"Authorization": {"Bearer " + sess.Token},
+	})
+}
+
+func NewTransportWithHeader(t *testing.T, h http.Header) *TransportWithHeader {
+	if t == nil {
+		panic("This function is for testing use only.")
+	}
+	return &TransportWithHeader{
+		RoundTripper: http.DefaultTransport,
+		h:            h,
+	}
+}
+
+type TransportWithHeader struct {
+	http.RoundTripper
+	h http.Header
+}
+
+func (ct *TransportWithHeader) GetHeader() http.Header {
+	return ct.h
+}
+
+func (ct *TransportWithHeader) RoundTrip(req *http.Request) (*http.Response, error) {
+	for k := range ct.h {
+		req.Header.Set(k, ct.h.Get(k))
+	}
+	return ct.RoundTripper.RoundTrip(req)
+}
+
+func AssertNoCSRFCookieInResponse(t *testing.T, _ *httptest.Server, _ *http.Client, r *http.Response) {
+	found := false
+	for _, c := range r.Cookies() {
+		if strings.HasPrefix(c.Name, "csrf_token") {
+			found = true
+		}
+	}
+	require.False(t, found)
 }

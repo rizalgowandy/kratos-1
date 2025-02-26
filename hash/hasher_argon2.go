@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package hash
 
 import (
@@ -11,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/argon2"
@@ -37,16 +41,20 @@ func NewHasherArgon2(c Argon2Configuration) *Argon2 {
 }
 
 func toKB(mem bytesize.ByteSize) uint32 {
+	//nolint:gosec // disable G115
 	return uint32(mem / bytesize.KB)
 }
 
 func (h *Argon2) Generate(ctx context.Context, password []byte) ([]byte, error) {
-	ctx, span := otel.GetTracerProvider().Tracer(tracingComponent).Start(ctx, "hash.Argon2.Generate")
-	defer span.End()
-	p := h.c.Config(ctx).HasherArgon2()
-	span.SetAttributes(attribute.String("argon2.config", fmt.Sprintf("#%v", p)))
+	conf := h.c.Config().HasherArgon2(ctx)
 
-	salt := make([]byte, p.SaltLength)
+	_, span := otel.GetTracerProvider().Tracer(tracingComponent).Start(ctx, "hash.Generate", trace.WithAttributes(
+		attribute.String("hash.type", "argon2id"),
+		attribute.String("hash.config", fmt.Sprintf("%#v", conf)),
+	))
+	defer span.End()
+
+	salt := make([]byte, conf.SaltLength)
 	if _, err := rand.Read(salt); err != nil {
 		return nil, err
 	}
@@ -54,13 +62,13 @@ func (h *Argon2) Generate(ctx context.Context, password []byte) ([]byte, error) 
 	// Pass the plaintext password, salt and parameters to the argon2.IDKey
 	// function. This will generate a hash of the password using the Argon2id
 	// variant.
-	hash := argon2.IDKey([]byte(password), salt, p.Iterations, toKB(p.Memory), p.Parallelism, p.KeyLength)
+	hash := argon2.IDKey(password, salt, conf.Iterations, toKB(conf.Memory), conf.Parallelism, conf.KeyLength)
 
 	var b bytes.Buffer
 	if _, err := fmt.Fprintf(
 		&b,
 		"$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
-		argon2.Version, toKB(p.Memory), p.Iterations, p.Parallelism,
+		argon2.Version, toKB(conf.Memory), conf.Iterations, conf.Parallelism,
 		base64.RawStdEncoding.EncodeToString(salt),
 		base64.RawStdEncoding.EncodeToString(hash),
 	); err != nil {

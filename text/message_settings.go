@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package text
 
 import (
@@ -6,13 +9,14 @@ import (
 	"time"
 )
 
-func NewErrorValidationSettingsFlowExpired(ago time.Duration) *Message {
+func NewErrorValidationSettingsFlowExpired(expiredAt time.Time) *Message {
 	return &Message{
 		ID:   ErrorValidationSettingsFlowExpired,
-		Text: fmt.Sprintf("The settings flow expired %.2f minutes ago, please try again.", ago.Minutes()),
+		Text: fmt.Sprintf("The settings flow expired %.2f minutes ago, please try again.", Since(expiredAt).Minutes()),
 		Type: Error,
-		Context: context(map[string]interface{}{
-			"expired_at": Now().UTC().Add(ago),
+		Context: context(map[string]any{
+			"expired_at":      expiredAt,
+			"expired_at_unix": expiredAt.Unix(),
 		}),
 	}
 }
@@ -30,7 +34,7 @@ func NewInfoSelfServiceSettingsTOTPSecret(secret string) *Message {
 		ID:   InfoSelfServiceSettingsTOTPSecret,
 		Text: secret,
 		Type: Info,
-		Context: context(map[string]interface{}{
+		Context: context(map[string]any{
 			"secret": secret,
 		}),
 	}
@@ -47,7 +51,7 @@ func NewInfoSelfServiceSettingsUpdateSuccess() *Message {
 	return &Message{
 		ID:   InfoSelfServiceSettingsUpdateSuccess,
 		Text: "Your changes have been saved!",
-		Type: Info,
+		Type: Success,
 	}
 }
 
@@ -91,12 +95,12 @@ func NewInfoSelfServiceSettingsLookupConfirm() *Message {
 	}
 }
 
-func NewInfoSelfServiceSettingsLookupSecretList(secrets []string, raw interface{}) *Message {
+func NewInfoSelfServiceSettingsLookupSecretList(secrets []string, raw any) *Message {
 	return &Message{
 		ID:   InfoSelfServiceSettingsLookupSecretList,
 		Text: strings.Join(secrets, ", "),
 		Type: Info,
-		Context: context(map[string]interface{}{
+		Context: context(map[string]any{
 			"secrets": raw,
 		}),
 	}
@@ -106,7 +110,7 @@ func NewInfoSelfServiceSettingsLookupSecret(secret string) *Message {
 		ID:   InfoSelfServiceSettingsLookupSecret,
 		Text: secret,
 		Type: Info,
-		Context: context(map[string]interface{}{
+		Context: context(map[string]any{
 			"secret": secret,
 		}),
 	}
@@ -117,8 +121,9 @@ func NewInfoSelfServiceSettingsLookupSecretUsed(usedAt time.Time) *Message {
 		ID:   InfoSelfServiceSettingsLookupSecretUsed,
 		Text: fmt.Sprintf("Secret was used at %s", usedAt),
 		Type: Info,
-		Context: context(map[string]interface{}{
-			"used_at": usedAt,
+		Context: context(map[string]any{
+			"used_at":      usedAt,
+			"used_at_unix": usedAt.Unix(),
 		}),
 	}
 }
@@ -136,7 +141,7 @@ func NewInfoSelfServiceSettingsUpdateLinkOIDC(provider string) *Message {
 		ID:   InfoSelfServiceSettingsUpdateLinkOidc,
 		Text: fmt.Sprintf("Link %s", provider),
 		Type: Info,
-		Context: context(map[string]interface{}{
+		Context: context(map[string]any{
 			"provider": provider,
 		}),
 	}
@@ -147,7 +152,7 @@ func NewInfoSelfServiceSettingsUpdateUnlinkOIDC(provider string) *Message {
 		ID:   InfoSelfServiceSettingsUpdateUnlinkOidc,
 		Text: fmt.Sprintf("Unlink %s", provider),
 		Type: Info,
-		Context: context(map[string]interface{}{
+		Context: context(map[string]any{
 			"provider": provider,
 		}),
 	}
@@ -157,6 +162,14 @@ func NewInfoSelfServiceSettingsRegisterWebAuthn() *Message {
 	return &Message{
 		ID:   InfoSelfServiceSettingsRegisterWebAuthn,
 		Text: "Add security key",
+		Type: Info,
+	}
+}
+
+func NewInfoSelfServiceSettingsRegisterPasskey() *Message {
+	return &Message{
+		ID:   InfoSelfServiceSettingsRegisterPasskey,
+		Text: "Add passkey",
 		Type: Info,
 	}
 }
@@ -174,9 +187,23 @@ func NewInfoSelfServiceRemoveWebAuthn(name string, createdAt time.Time) *Message
 		ID:   InfoSelfServiceSettingsRemoveWebAuthn,
 		Text: fmt.Sprintf("Remove security key \"%s\"", name),
 		Type: Info,
-		Context: context(map[string]interface{}{
-			"display_name": name,
-			"added_at":     createdAt,
+		Context: context(map[string]any{
+			"display_name":  name,
+			"added_at":      createdAt,
+			"added_at_unix": createdAt.Unix(),
+		}),
+	}
+}
+
+func NewInfoSelfServiceRemovePasskey(name string, createdAt time.Time) *Message {
+	return &Message{
+		ID:   InfoSelfServiceSettingsRemovePasskey,
+		Text: fmt.Sprintf("Remove passkey \"%s\"", name),
+		Type: Info,
+		Context: context(map[string]any{
+			"display_name":  name,
+			"added_at":      createdAt,
+			"added_at_unix": createdAt.Unix(),
 		}),
 	}
 }

@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
@@ -19,13 +22,15 @@ import (
 
 type ProviderDingTalk struct {
 	config *Configuration
-	reg    dependencies
+	reg    Dependencies
 }
+
+var _ OAuth2Provider = (*ProviderDingTalk)(nil)
 
 func NewProviderDingTalk(
 	config *Configuration,
-	reg dependencies,
-) *ProviderDingTalk {
+	reg Dependencies,
+) Provider {
 	return &ProviderDingTalk{
 		config: config,
 		reg:    reg,
@@ -48,7 +53,7 @@ func (g *ProviderDingTalk) oauth2(ctx context.Context) *oauth2.Config {
 		Endpoint:     endpoint,
 		// DingTalk only allow to set scopes: openid or openid corpid
 		Scopes:      g.config.Scope,
-		RedirectURL: g.config.Redir(g.reg.Config(ctx).OIDCRedirectURIBase()),
+		RedirectURL: g.config.Redir(g.reg.Config().OIDCRedirectURIBase(ctx)),
 	}
 }
 
@@ -62,7 +67,7 @@ func (g *ProviderDingTalk) OAuth2(ctx context.Context) (*oauth2.Config, error) {
 	return g.oauth2(ctx), nil
 }
 
-func (g *ProviderDingTalk) Exchange(ctx context.Context, code string, opts ...oauth2.AuthCodeOption) (*oauth2.Token, error) {
+func (g *ProviderDingTalk) ExchangeOAuth2Token(ctx context.Context, code string, opts ...oauth2.AuthCodeOption) (*oauth2.Token, error) {
 	conf, err := g.OAuth2(ctx)
 	if err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
@@ -92,6 +97,10 @@ func (g *ProviderDingTalk) Exchange(ctx context.Context, code string, opts ...oa
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 	defer resp.Body.Close()
+
+	if err := logUpstreamError(g.reg.Logger(), resp); err != nil {
+		return nil, err
+	}
 
 	var dToken struct {
 		ErrCode     int    `json:"code"`
@@ -131,6 +140,10 @@ func (g *ProviderDingTalk) Claims(ctx context.Context, exchange *oauth2.Token, _
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 	defer resp.Body.Close()
+
+	if err := logUpstreamError(g.reg.Logger(), resp); err != nil {
+		return nil, err
+	}
 
 	var user struct {
 		Nick      string `json:"nick"`

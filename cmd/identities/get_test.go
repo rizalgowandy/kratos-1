@@ -1,12 +1,12 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package identities_test
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"testing"
-
-	"github.com/spf13/cobra"
 
 	"github.com/ory/kratos/cmd/identities"
 	"github.com/ory/x/assertx"
@@ -21,8 +21,7 @@ import (
 )
 
 func TestGetCmd(t *testing.T) {
-	c := identities.NewGetIdentityCmd(new(cobra.Command))
-	reg := setup(t, c)
+	reg, cmd := setup(t, identities.NewGetIdentityCmd)
 
 	t.Run("case=gets a single identity", func(t *testing.T) {
 		i := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
@@ -30,7 +29,7 @@ func TestGetCmd(t *testing.T) {
 		i.MetadataAdmin = []byte(`"admin"`)
 		require.NoError(t, reg.Persister().CreateIdentity(context.Background(), i))
 
-		stdOut := execNoErr(t, c, i.ID.String())
+		stdOut := cmd.ExecNoErr(t, i.ID.String())
 
 		ij, err := json.Marshal(identity.WithCredentialsMetadataAndAdminMetadataInJSON(*i))
 		require.NoError(t, err)
@@ -41,7 +40,7 @@ func TestGetCmd(t *testing.T) {
 	t.Run("case=gets three identities", func(t *testing.T) {
 		is, ids := makeIdentities(t, reg, 3)
 
-		stdOut := execNoErr(t, c, ids...)
+		stdOut := cmd.ExecNoErr(t, ids...)
 
 		isj, err := json.Marshal(is)
 		require.NoError(t, err)
@@ -50,7 +49,7 @@ func TestGetCmd(t *testing.T) {
 	})
 
 	t.Run("case=fails with unknown ID", func(t *testing.T) {
-		stdErr := execErr(t, c, x.NewUUID().String())
+		stdErr := cmd.ExecExpectedErr(t, x.NewUUID().String())
 
 		assert.Contains(t, stdErr, "Unable to locate the resource", stdErr)
 	})
@@ -63,10 +62,12 @@ func TestGetCmd(t *testing.T) {
 				return out
 			}
 			transform := func(token string) string {
-				if !encrypt {
-					return token
+				if encrypt {
+					s, err := reg.Cipher(context.Background()).Encrypt(context.Background(), []byte(token))
+					require.NoError(t, err)
+					return s
 				}
-				return hex.EncodeToString([]byte(token))
+				return token
 			}
 			return identity.Credentials{
 				Type:        identity.CredentialsTypeOIDC,
@@ -78,6 +79,7 @@ func TestGetCmd(t *testing.T) {
 						InitialAccessToken:  transform(accessToken + "0"),
 						InitialRefreshToken: transform(refreshToken + "0"),
 						InitialIDToken:      transform(idToken + "0"),
+						Organization:        "foo-org-id",
 					},
 					{
 						Subject:             "baz",
@@ -85,6 +87,7 @@ func TestGetCmd(t *testing.T) {
 						InitialAccessToken:  transform(accessToken + "1"),
 						InitialRefreshToken: transform(refreshToken + "1"),
 						InitialIDToken:      transform(idToken + "1"),
+						Organization:        "bar-org-id",
 					},
 				}}),
 			}
@@ -97,14 +100,13 @@ func TestGetCmd(t *testing.T) {
 		di := i.CopyWithoutCredentials()
 		di.SetCredentials(identity.CredentialsTypeOIDC, applyCredentials("uniqueIdentifier", "accessBar", "refreshBar", "idBar", false))
 
-		require.NoError(t, c.Flags().Set(identities.FlagIncludeCreds, "oidc"))
 		require.NoError(t, reg.Persister().CreateIdentity(context.Background(), i))
 
-		stdOut := execNoErr(t, c, i.ID.String())
+		stdOut := cmd.ExecNoErr(t, "--"+identities.FlagIncludeCreds, "oidc", i.ID.String())
 		ij, err := json.Marshal(identity.WithCredentialsAndAdminMetadataInJSON(*di))
 		require.NoError(t, err)
 
-		ii := []string{"schema_url", "state_changed_at", "created_at", "updated_at", "credentials.oidc.created_at", "credentials.oidc.updated_at", "credentials.oidc.version"}
+		ii := []string{"id", "schema_url", "state_changed_at", "created_at", "updated_at", "credentials.oidc.created_at", "credentials.oidc.updated_at", "credentials.oidc.version"}
 		assertx.EqualAsJSONExcept(t, json.RawMessage(ij), json.RawMessage(stdOut), ii)
 	})
 }

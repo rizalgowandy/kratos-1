@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
@@ -10,6 +13,7 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
 
+	"github.com/ory/x/httpx"
 	"github.com/ory/x/stringslice"
 	"github.com/ory/x/stringsx"
 
@@ -19,15 +23,17 @@ import (
 	"github.com/ory/herodot"
 )
 
+var _ OAuth2Provider = (*ProviderSpotify)(nil)
+
 type ProviderSpotify struct {
 	config *Configuration
-	reg    dependencies
+	reg    Dependencies
 }
 
 func NewProviderSpotify(
 	config *Configuration,
-	reg dependencies,
-) *ProviderSpotify {
+	reg Dependencies,
+) Provider {
 	return &ProviderSpotify{
 		config: config,
 		reg:    reg,
@@ -44,7 +50,7 @@ func (g *ProviderSpotify) oauth2(ctx context.Context) *oauth2.Config {
 		ClientSecret: g.config.ClientSecret,
 		Endpoint:     spotify.Endpoint,
 		Scopes:       g.config.Scope,
-		RedirectURL:  g.config.Redir(g.reg.Config(ctx).OIDCRedirectURIBase()),
+		RedirectURL:  g.config.Redir(g.reg.Config().OIDCRedirectURIBase(ctx)),
 	}
 }
 
@@ -65,12 +71,13 @@ func (g *ProviderSpotify) Claims(ctx context.Context, exchange *oauth2.Token, qu
 	}
 
 	auth := spotifyauth.New(
-		spotifyauth.WithRedirectURL(g.config.Redir(g.reg.Config(ctx).OIDCRedirectURIBase())),
+		spotifyauth.WithRedirectURL(g.config.Redir(g.reg.Config().OIDCRedirectURIBase(ctx))),
 		spotifyauth.WithScopes(spotifyauth.ScopeUserReadPrivate))
 
-	client := spotifyapi.New(auth.Client(ctx, exchange))
+	ctx, client := httpx.SetOAuth2(ctx, g.reg.HTTPClient(ctx), auth, exchange)
+	spotifyClient := spotifyapi.New(client.HTTPClient)
 
-	user, err := client.CurrentUser(ctx)
+	user, err := spotifyClient.CurrentUser(ctx)
 	if err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}

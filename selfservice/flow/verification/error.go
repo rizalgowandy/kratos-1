@@ -1,8 +1,17 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package verification
 
 import (
 	"net/http"
 	"net/url"
+
+	"github.com/gofrs/uuid"
+
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/ory/kratos/x/events"
 
 	"github.com/ory/kratos/ui/node"
 
@@ -19,15 +28,14 @@ import (
 	"github.com/ory/kratos/x"
 )
 
-var (
-	ErrHookAbortFlow = errors.New("aborted verification hook execution")
-)
+var ErrHookAbortFlow = errors.New("aborted verification hook execution")
 
 type (
 	errorHandlerDependencies interface {
 		errorx.ManagementProvider
 		x.WriterProvider
 		x.LoggingProvider
+		x.CSRFProvider
 		x.CSRFTokenGeneratorProvider
 		config.Provider
 		FlowPersistenceProvider
@@ -54,28 +62,41 @@ func (s *ErrorHandler) WriteFlowError(
 	group node.UiNodeGroup,
 	err error,
 ) {
-	s.d.Audit().
+	logger := s.d.Audit().
 		WithError(err).
 		WithRequest(r).
-		WithField("verification_flow", f).
+		WithField("verification_flow", f.ToLoggerField())
+
+	logger.
 		Info("Encountered self-service verification error.")
 
 	if f == nil {
+		trace.SpanFromContext(r.Context()).AddEvent(events.NewVerificationFailed(r.Context(), uuid.Nil, "", "", err))
 		s.forward(w, r, nil, err)
 		return
 	}
+	trace.SpanFromContext(r.Context()).AddEvent(events.NewVerificationFailed(r.Context(), f.ID, string(f.Type), f.Active.String(), err))
 
 	if e := new(flow.ExpiredError); errors.As(err, &e) {
+		strategy, err := s.d.VerificationStrategies(r.Context()).Strategy(f.Active.String())
+		if err != nil {
+			strategy, err = s.d.GetActiveVerificationStrategy(r.Context())
+			// Can't retry the verification if no strategy has been set
+			if err != nil {
+				s.d.SelfServiceErrorManager().Forward(r.Context(), w, r, err)
+				return
+			}
+		}
 		// create new flow because the old one is not valid
-		a, err := FromOldFlow(s.d.Config(r.Context()), s.d.Config(r.Context()).SelfServiceFlowVerificationRequestLifespan(),
-			s.d.GenerateCSRFToken(r), r, s.d.VerificationStrategies(r.Context()), f)
+		a, err := FromOldFlow(s.d.Config(), s.d.Config().SelfServiceFlowVerificationRequestLifespan(r.Context()),
+			s.d.CSRFHandler().RegenerateToken(w, r), r, strategy, f)
 		if err != nil {
 			// failed to create a new session and redirect to it, handle that error as a new one
 			s.WriteFlowError(w, r, f, group, err)
 			return
 		}
 
-		a.UI.Messages.Add(text.NewErrorValidationVerificationFlowExpired(e.Ago))
+		a.UI.Messages.Add(text.NewErrorValidationVerificationFlowExpired(e.ExpiredAt))
 		if err := s.d.VerificationFlowPersister().CreateVerificationFlow(r.Context(), a); err != nil {
 			s.forward(w, r, a, err)
 			return
@@ -85,10 +106,10 @@ func (s *ErrorHandler) WriteFlowError(
 		//
 		// https://github.com/ory/kratos/issues/2049!!
 		if a.Type == flow.TypeAPI || x.IsJSONRequest(r) {
-			http.Redirect(w, r, urlx.CopyWithQuery(urlx.AppendPaths(s.d.Config(r.Context()).SelfPublicURL(),
+			http.Redirect(w, r, urlx.CopyWithQuery(urlx.AppendPaths(s.d.Config().SelfPublicURL(r.Context()),
 				RouteGetFlow), url.Values{"id": {a.ID.String()}}).String(), http.StatusSeeOther)
 		} else {
-			http.Redirect(w, r, a.AppendTo(s.d.Config(r.Context()).SelfServiceFlowVerificationUI()).String(), http.StatusSeeOther)
+			http.Redirect(w, r, a.AppendTo(s.d.Config().SelfServiceFlowVerificationUI(r.Context())).String(), http.StatusSeeOther)
 		}
 		return
 	}
@@ -105,7 +126,7 @@ func (s *ErrorHandler) WriteFlowError(
 	}
 
 	if f.Type == flow.TypeBrowser && !x.IsJSONRequest(r) {
-		http.Redirect(w, r, f.AppendTo(s.d.Config(r.Context()).SelfServiceFlowVerificationUI()).String(), http.StatusSeeOther)
+		http.Redirect(w, r, f.AppendTo(s.d.Config().SelfServiceFlowVerificationUI(r.Context())).String(), http.StatusSeeOther)
 		return
 	}
 

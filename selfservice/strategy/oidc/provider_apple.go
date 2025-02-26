@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
@@ -9,6 +12,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/golang-jwt/jwt/v4"
 
 	"github.com/pkg/errors"
@@ -18,17 +22,22 @@ import (
 
 type ProviderApple struct {
 	*ProviderGenericOIDC
+	JWKSUrl string
 }
+
+var _ OAuth2Provider = (*ProviderApple)(nil)
 
 func NewProviderApple(
 	config *Configuration,
-	reg dependencies,
-) *ProviderApple {
+	reg Dependencies,
+) Provider {
+	config.IssuerURL = "https://appleid.apple.com"
 	return &ProviderApple{
 		ProviderGenericOIDC: &ProviderGenericOIDC{
 			config: config,
 			reg:    reg,
 		},
+		JWKSUrl: "https://appleid.apple.com/auth/keys",
 	}
 }
 
@@ -110,7 +119,7 @@ func (a *ProviderApple) Claims(ctx context.Context, exchange *oauth2.Token, quer
 	if err != nil {
 		return claims, err
 	}
-	decodeQuery(query, claims)
+	a.DecodeQuery(query, claims)
 
 	return claims, nil
 }
@@ -119,7 +128,7 @@ func (a *ProviderApple) Claims(ctx context.Context, exchange *oauth2.Token, quer
 // The info is sent as an extra query parameter to the redirect URL.
 // See https://developer.apple.com/documentation/sign_in_with_apple/sign_in_with_apple_js/configuring_your_webpage_for_sign_in_with_apple#3331292
 // Note that there's no way to make sure the info hasn't been tampered with.
-func decodeQuery(query url.Values, claims *Claims) {
+func (a *ProviderApple) DecodeQuery(query url.Values, claims *Claims) {
 	var user struct {
 		Name *struct {
 			FirstName *string `json:"firstName"`
@@ -132,13 +141,32 @@ func decodeQuery(query url.Values, claims *Claims) {
 				if claims.GivenName == "" {
 					claims.GivenName = *firstName
 				}
-				if claims.FamilyName == "" {
-					claims.FamilyName = *firstName
-				}
 			}
-			if lastName := name.LastName; lastName != nil && claims.LastName == "" {
-				claims.LastName = *lastName
+			if lastName := name.LastName; lastName != nil {
+				if claims.LastName == "" {
+					claims.LastName = *lastName
+				}
+				if claims.FamilyName == "" {
+					claims.FamilyName = *lastName
+				}
 			}
 		}
 	}
+}
+
+var _ IDTokenVerifier = new(ProviderApple)
+
+const issuerURLApple = "https://appleid.apple.com"
+
+func (a *ProviderApple) Verify(ctx context.Context, rawIDToken string) (*Claims, error) {
+	keySet := oidc.NewRemoteKeySet(ctx, a.JWKSUrl)
+	ctx = oidc.ClientContext(ctx, a.reg.HTTPClient(ctx).HTTPClient)
+
+	return verifyToken(ctx, keySet, a.config, rawIDToken, issuerURLApple)
+}
+
+var _ NonceValidationSkipper = new(ProviderApple)
+
+func (a *ProviderApple) CanSkipNonce(c *Claims) bool {
+	return c.NonceSupported
 }

@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package verification
 
 import (
@@ -12,23 +15,25 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 
-	"github.com/ory/kratos/corp"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/selfservice/flow"
+	"github.com/ory/kratos/session"
 	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
 
+var _ flow.Flow = new(Flow)
+
 // A Verification Flow
 //
 // Used to verify an out-of-band communication
 // channel such as an email address or a phone number.
 //
-// For more information head over to: https://www.ory.sh/docs/kratos/selfservice/flows/verify-email-account-activation
+// For more information head over to: https://www.ory.sh/docs/kratos/self-service/flows/verify-email-account-activation
 //
-// swagger:model selfServiceVerificationFlow
+// swagger:model verificationFlow
 type Flow struct {
 	// ID represents the request's unique ID. When performing the verification flow, this
 	// represents the id in the verify ui's query parameter: http://<selfservice.flows.verification.ui_url>?request=<id>
@@ -75,6 +80,10 @@ type Flow struct {
 	// required: true
 	State State `json:"state" faker:"-" db:"state"`
 
+	// OAuth2LoginChallenge holds the login challenge originally set during the registration flow.
+	OAuth2LoginChallenge sqlxx.NullString `json:"-" db:"oauth2_login_challenge"`
+	OAuth2LoginChallengeParams
+
 	// CSRFToken contains the anti-csrf token associated with this request.
 	CSRFToken string `json:"-" db:"csrf_token"`
 
@@ -83,7 +92,26 @@ type Flow struct {
 	// UpdatedAt is a helper struct field for gobuffalo.pop.
 	UpdatedAt time.Time `json:"-" faker:"-" db:"updated_at"`
 	NID       uuid.UUID `json:"-"  faker:"-" db:"nid"`
+
+	// TransientPayload is used to pass data from the verification flow to hooks and email templates
+	//
+	// required: false
+	TransientPayload json.RawMessage `json:"transient_payload,omitempty" faker:"-" db:"-"`
 }
+
+type OAuth2LoginChallengeParams struct {
+	// SessionID holds the session id if set from a registraton hook.
+	SessionID uuid.NullUUID `json:"-" faker:"-" db:"session_id"`
+
+	// IdentityID holds the identity id if set from a registraton hook.
+	IdentityID uuid.NullUUID `json:"-" faker:"-" db:"identity_id"`
+
+	// AMR contains a list of authentication methods that were used to verify the
+	// session if set from a registration hook.
+	AMR session.AuthenticationMethods `db:"authentication_methods" json:"-"`
+}
+
+var _ flow.Flow = new(Flow)
 
 func (f *Flow) GetType() flow.Type {
 	return f.Type
@@ -93,40 +121,42 @@ func (f *Flow) GetRequestURL() string {
 	return f.RequestURL
 }
 
-func (f Flow) TableName(ctx context.Context) string {
-	return corp.ContextualizeTableName(ctx, "selfservice_verification_flows")
+func (f Flow) TableName(context.Context) string {
+	return "selfservice_verification_flows"
 }
 
-func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategies Strategies, ft flow.Type) (*Flow, error) {
+func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategy Strategy, ft flow.Type) (*Flow, error) {
 	now := time.Now().UTC()
 	id := x.NewUUID()
 
 	// Pre-validate the return to URL which is contained in the HTTP request.
 	requestURL := x.RequestURL(r).String()
 	_, err := x.SecureRedirectTo(r,
-		conf.SelfServiceBrowserDefaultReturnTo(),
+		conf.SelfServiceBrowserDefaultReturnTo(r.Context()),
 		x.SecureRedirectUseSourceURL(requestURL),
-		x.SecureRedirectAllowURLs(conf.SelfServiceBrowserAllowedReturnToDomains()),
-		x.SecureRedirectAllowSelfServiceURLs(conf.SelfPublicURL()),
+		x.SecureRedirectAllowURLs(conf.SelfServiceBrowserAllowedReturnToDomains(r.Context())),
+		x.SecureRedirectAllowSelfServiceURLs(conf.SelfPublicURL(r.Context())),
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	f := &Flow{
-		ID:        id,
-		ExpiresAt: now.Add(exp), IssuedAt: now,
+		ID:         id,
+		ExpiresAt:  now.Add(exp),
+		IssuedAt:   now,
 		RequestURL: requestURL,
 		UI: &container.Container{
 			Method: "POST",
-			Action: flow.AppendFlowTo(urlx.AppendPaths(conf.SelfPublicURL(), RouteSubmitFlow), id).String(),
+			Action: flow.AppendFlowTo(urlx.AppendPaths(conf.SelfPublicURL(r.Context()), RouteSubmitFlow), id).String(),
 		},
 		CSRFToken: csrf,
-		State:     StateChooseMethod,
+		State:     flow.StateChooseMethod,
 		Type:      ft,
 	}
 
-	for _, strategy := range strategies {
+	if strategy != nil {
+		f.Active = sqlxx.NullString(strategy.NodeGroup())
 		if err := strategy.PopulateVerificationMethod(r, f); err != nil {
 			return nil, err
 		}
@@ -135,13 +165,13 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 	return f, nil
 }
 
-func FromOldFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategies Strategies, of *Flow) (*Flow, error) {
+func FromOldFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategy Strategy, of *Flow) (*Flow, error) {
 	f := of.Type
 	// Using the same flow in the recovery/verification context can lead to using API flow in a verification/recovery email
 	if of.Type == flow.TypeAPI {
 		f = flow.TypeBrowser
 	}
-	nf, err := NewFlow(conf, exp, csrf, r, strategies, f)
+	nf, err := NewFlow(conf, exp, csrf, r, strategy, f)
 	if err != nil {
 		return nil, err
 	}
@@ -150,17 +180,22 @@ func FromOldFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Re
 	return nf, nil
 }
 
-func NewPostHookFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategies Strategies, original flow.Flow) (*Flow, error) {
-	f, err := NewFlow(conf, exp, csrf, r, strategies, original.GetType())
+func NewPostHookFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategy Strategy, original flow.Flow) (*Flow, error) {
+	f, err := NewFlow(conf, exp, csrf, r, strategy, original.GetType())
 	if err != nil {
 		return nil, err
 	}
+	f.TransientPayload = original.GetTransientPayload()
 	requestURL, err := url.ParseRequestURI(original.GetRequestURL())
 	if err != nil {
 		requestURL = new(url.URL)
 	}
 	query := requestURL.Query()
-	query.Set("return_to", query.Get("after_verification_return_to"))
+	// we need to keep the return_to in-tact if the `after_verification_return_to` is empty
+	// otherwise we take the `after_verification_return_to` query parameter over the current `return_to`
+	if afterVerificationReturn := query.Get("after_verification_return_to"); afterVerificationReturn != "" {
+		query.Set("return_to", afterVerificationReturn)
+	}
 	query.Del("after_verification_return_to")
 	requestURL.RawQuery = query.Encode()
 	f.RequestURL = requestURL.String()
@@ -213,4 +248,68 @@ func (f *Flow) AfterFind(*pop.Connection) error {
 func (f *Flow) AfterSave(*pop.Connection) error {
 	f.SetReturnTo()
 	return nil
+}
+
+func (f *Flow) GetUI() *container.Container {
+	return f.UI
+}
+
+// ContinueURL generates the URL to show on the continue screen after succesful verification
+//
+// It follows the following precedence:
+//  1. If a `return_to` parameter has been passed to the flow's creation, is a valid URL and it's in the `selfservice.allowed_return_urls` that URL is returned
+//  2. If `selfservice.flows.verification.after` is set, that URL is returned
+//  3. As a fallback, the `selfservice.default_browser_return_url` URL is returned
+func (f *Flow) ContinueURL(ctx context.Context, config *config.Config) *url.URL {
+	flowContinueURL := config.SelfServiceFlowVerificationReturnTo(ctx, config.SelfServiceBrowserDefaultReturnTo(ctx))
+
+	// Parse the flows request URL
+	verificationRequestURL, err := urlx.Parse(f.GetRequestURL())
+	if err != nil {
+		// Return flow default, or global default return URL
+		return flowContinueURL
+	}
+
+	verificationRequest := http.Request{URL: verificationRequestURL}
+
+	returnTo, err := x.SecureRedirectTo(&verificationRequest, flowContinueURL,
+		x.SecureRedirectAllowSelfServiceURLs(config.SelfPublicURL(ctx)),
+		x.SecureRedirectAllowURLs(config.SelfServiceBrowserAllowedReturnToDomains(ctx)),
+	)
+	if err != nil {
+		// an error occured return flow default, or global default return URL
+		return flowContinueURL
+	}
+	return returnTo
+}
+
+func (f *Flow) GetState() State {
+	return f.State
+}
+
+func (f *Flow) GetFlowName() flow.FlowName {
+	return flow.VerificationFlow
+}
+
+func (f *Flow) SetState(state State) {
+	f.State = state
+}
+
+func (t *Flow) GetTransientPayload() json.RawMessage {
+	return t.TransientPayload
+}
+
+func (f *Flow) ToLoggerField() map[string]interface{} {
+	if f == nil {
+		return map[string]interface{}{}
+	}
+	return map[string]interface{}{
+		"id":          f.ID.String(),
+		"return_to":   f.ReturnTo,
+		"request_url": f.RequestURL,
+		"active":      f.Active,
+		"Type":        f.Type,
+		"nid":         f.NID,
+		"state":       f.State,
+	}
 }

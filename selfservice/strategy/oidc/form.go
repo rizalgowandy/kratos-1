@@ -1,10 +1,13 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
 	"bytes"
 	"encoding/json"
 
-	"github.com/imdario/mergo"
+	"dario.cat/mergo"
 
 	"github.com/ory/kratos/identity"
 )

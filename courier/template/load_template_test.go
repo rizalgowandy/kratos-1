@@ -1,10 +1,12 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package template_test
 
 import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,7 +21,7 @@ import (
 	"github.com/ory/kratos/internal"
 	"github.com/ory/x/fetcher"
 
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -27,7 +29,7 @@ import (
 )
 
 func TestLoadTextTemplate(t *testing.T) {
-	var executeTextTemplate = func(t *testing.T, dir, name, pattern string, model map[string]interface{}) string {
+	executeTextTemplate := func(t *testing.T, dir, name, pattern string, model map[string]interface{}) string {
 		ctx := context.Background()
 		_, reg := internal.NewFastRegistryWithMocks(t)
 		tp, err := template.LoadText(ctx, reg, os.DirFS(dir), name, pattern, model, "")
@@ -35,7 +37,7 @@ func TestLoadTextTemplate(t *testing.T) {
 		return tp
 	}
 
-	var executeHTMLTemplate = func(t *testing.T, dir, name, pattern string, model map[string]interface{}) string {
+	executeHTMLTemplate := func(t *testing.T, dir, name, pattern string, model map[string]interface{}) string {
 		ctx := context.Background()
 		_, reg := internal.NewFastRegistryWithMocks(t)
 		tp, err := template.LoadHTML(ctx, reg, os.DirFS(dir), name, pattern, model, "")
@@ -49,20 +51,20 @@ func TestLoadTextTemplate(t *testing.T) {
 	})
 
 	t.Run("method=fallback to bundled", func(t *testing.T) {
-		template.Cache, _ = lru.New(16) // prevent Cache hit
+		template.Cache, _ = lru.New[string, template.Template](16) // prevent Cache hit
 		actual := executeTextTemplate(t, "some/inexistent/dir", "test_stub/email.body.gotmpl", "", nil)
 		assert.Contains(t, actual, "stub email")
 	})
 
 	t.Run("method=with Sprig functions", func(t *testing.T) {
-		template.Cache, _ = lru.New(16)                     // prevent Cache hit
-		m := map[string]interface{}{"input": "hello world"} // create a simple model
+		template.Cache, _ = lru.New[string, template.Template](16) // prevent Cache hit
+		m := map[string]interface{}{"input": "hello world"}        // create a simple model
 		actual := executeTextTemplate(t, "courier/builtin/templates/test_stub", "email.body.sprig.gotmpl", "", m)
 		assert.Contains(t, actual, "HelloWorld,HELLOWORLD")
 	})
 
 	t.Run("method=sprig should not support non-hermetic", func(t *testing.T) {
-		template.Cache, _ = lru.New(16)
+		template.Cache, _ = lru.New[string, template.Template](16)
 		ctx := context.Background()
 		_, reg := internal.NewFastRegistryWithMocks(t)
 
@@ -78,8 +80,8 @@ func TestLoadTextTemplate(t *testing.T) {
 	})
 
 	t.Run("method=html with nested templates", func(t *testing.T) {
-		template.Cache, _ = lru.New(16)              // prevent Cache hit
-		m := map[string]interface{}{"lang": "en_US"} // create a simple model
+		template.Cache, _ = lru.New[string, template.Template](16) // prevent Cache hit
+		m := map[string]interface{}{"lang": "en_US"}               // create a simple model
 		actual := executeHTMLTemplate(t, "courier/builtin/templates/test_stub", "email.body.html.gotmpl", "email.body.html*", m)
 		assert.Contains(t, actual, "lang=en_US")
 	})
@@ -89,7 +91,7 @@ func TestLoadTextTemplate(t *testing.T) {
 		name := x.NewUUID().String() + ".body.gotmpl"
 		fp := filepath.Join(dir, name)
 
-		require.NoError(t, os.WriteFile(fp, []byte("cached stub body"), 0666))
+		require.NoError(t, os.WriteFile(fp, []byte("cached stub body"), 0o666))
 		assert.Contains(t, executeTextTemplate(t, dir, name, "", nil), "cached stub body")
 
 		require.NoError(t, os.RemoveAll(fp))
@@ -105,7 +107,7 @@ func TestLoadTextTemplate(t *testing.T) {
 		t.Run("case=base64 encoded data", func(t *testing.T) {
 			t.Run("html template", func(t *testing.T) {
 				m := map[string]interface{}{"lang": "en_US"}
-				f, err := ioutil.ReadFile("courier/builtin/templates/test_stub/email.body.html.en_US.gotmpl")
+				f, err := os.ReadFile("courier/builtin/templates/test_stub/email.body.html.en_US.gotmpl")
 				require.NoError(t, err)
 				b64 := base64.StdEncoding.EncodeToString(f)
 				tp, err := template.LoadHTML(ctx, reg, nil, "", "", m, "base64://"+b64)
@@ -115,7 +117,7 @@ func TestLoadTextTemplate(t *testing.T) {
 
 			t.Run("case=plaintext", func(t *testing.T) {
 				m := map[string]interface{}{"Body": "something"}
-				f, err := ioutil.ReadFile("courier/builtin/templates/test_stub/email.body.plaintext.gotmpl")
+				f, err := os.ReadFile("courier/builtin/templates/test_stub/email.body.plaintext.gotmpl")
 				require.NoError(t, err)
 
 				b64 := base64.StdEncoding.EncodeToString(f)
@@ -124,7 +126,6 @@ func TestLoadTextTemplate(t *testing.T) {
 				require.NoError(t, err)
 				assert.Contains(t, tp, "stub email body something")
 			})
-
 		})
 
 		t.Run("case=file resource", func(t *testing.T) {
@@ -167,7 +168,6 @@ func TestLoadTextTemplate(t *testing.T) {
 				require.NoError(t, err)
 				assert.Contains(t, tp, "stub email body something")
 			})
-
 		})
 
 		t.Run("case=unsupported resource", func(t *testing.T) {
@@ -182,19 +182,18 @@ func TestLoadTextTemplate(t *testing.T) {
 		})
 
 		t.Run("case=disallowed resources", func(t *testing.T) {
-			require.NoError(t, reg.Config(ctx).Source().Set(config.ViperKeyClientHTTPNoPrivateIPRanges, true))
+			require.NoError(t, reg.Config().Set(ctx, config.ViperKeyClientHTTPNoPrivateIPRanges, true))
 			reg.HTTPClient(ctx).RetryMax = 1
 			reg.HTTPClient(ctx).RetryWaitMax = time.Millisecond
 
 			_, err := template.LoadHTML(ctx, reg, nil, "", "", map[string]interface{}{}, "http://localhost:8080/1234")
 
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), "is in the")
+			assert.Contains(t, err.Error(), "is not a permitted destination")
 
 			_, err = template.LoadText(ctx, reg, nil, "", "", map[string]interface{}{}, "http://localhost:8080/1234")
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), "is in the")
-
+			assert.Contains(t, err.Error(), "is not a permitted destination")
 		})
 
 		t.Run("method=cache works", func(t *testing.T) {
@@ -206,6 +205,5 @@ func TestLoadTextTemplate(t *testing.T) {
 
 			require.NotEqualf(t, tp1, tp2, "Expected remote template 1 and remote template 2 to not be equal")
 		})
-
 	})
 }

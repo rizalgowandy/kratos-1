@@ -1,14 +1,17 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
 	"encoding/json"
+	"maps"
 	"net/url"
 	"strings"
 
 	"github.com/pkg/errors"
 
 	"github.com/ory/herodot"
-
 	"github.com/ory/x/urlx"
 )
 
@@ -24,12 +27,18 @@ type Configuration struct {
 	// - gitlab
 	// - microsoft
 	// - discord
+	// - salesforce
 	// - slack
 	// - facebook
+	// - auth0
 	// - vk
 	// - yandex
 	// - apple
+	// - spotify
+	// - netid
 	// - dingtalk
+	// - linkedin
+	// - patreon
 	Provider string `json:"provider"`
 
 	// Label represents an optional label which can be used in the UI generation.
@@ -61,9 +70,10 @@ type Configuration struct {
 	Tenant string `json:"microsoft_tenant"`
 
 	// SubjectSource is a flag which controls from which endpoint the subject identifier is taken by microsoft provider.
-	// Can be either `userinfo` or `me`.
-	// If the value is `uerinfo` then the subject identifier is taken from sub field of uderifo standard endpoint response.
+	// Can be either `userinfo` or `me` or `oid`.
+	// If the value is `userinfo` then the subject identifier is taken from sub field of userinfo standard endpoint response.
 	// If the value is `me` then the `id` field of https://graph.microsoft.com/v1.0/me response is taken as subject.
+	// If the value is `oid` then the the oid (Object ID) is taken to identify users across different services.
 	// The default is `userinfo`.
 	SubjectSource string `json:"subject_source"`
 
@@ -90,17 +100,58 @@ type Configuration struct {
 	// It can be either a URL (file://, http(s)://, base64://) or an inline JSONNet code snippet.
 	Mapper string `json:"mapper_url"`
 
-	// RequestedClaims string encoded json object that specifies claims and optionally their properties which should be
+	// RequestedClaims is a string encoded json object that specifies claims and optionally their properties that should be
 	// included in the id_token or returned from the UserInfo Endpoint.
 	//
 	// More information: https://openid.net/specs/openid-connect-core-1_0.html#ClaimsParameter
 	RequestedClaims json.RawMessage `json:"requested_claims"`
+
+	// An optional organization ID that this provider belongs to.
+	// This parameter is only effective in the Ory Network.
+	OrganizationID string `json:"organization_id"`
+
+	// AdditionalIDTokenAudiences is a list of additional audiences allowed in the ID Token.
+	// This is only relevant in OIDC flows that submit an IDToken instead of using the callback from the OIDC provider.
+	AdditionalIDTokenAudiences []string `json:"additional_id_token_audiences"`
+
+	// ClaimsSource is a flag which controls where the claims are taken from when
+	// using the generic provider. Can be either `userinfo` (calls the userinfo
+	// endpoint to get the claims) or `id_token` (takes the claims from the id
+	// token). It defaults to `id_token`.
+	ClaimsSource string `json:"claims_source"`
+
+	// PKCE controls if the OpenID Connect OAuth2 flow should use PKCE (Proof Key for Code Exchange).
+	// Possible values are: `auto` (default), `never`, `force`.
+	// - `auto`: PKCE is used if the provider supports it. Requires setting `issuer_url`.
+	// - `never`: Disable PKCE entirely for this provider, even if the provider advertises support for it.
+	// - `force`: Always use PKCE, even if the provider does not advertise support for it. OAuth2 flows will fail if the provider does not support PKCE.
+	// IMPORTANT: If you set this to `force`, you must whitelist a different return URL for your OAuth2 client in the provider's configuration.
+	// Instead of <base-url>/self-service/methods/oidc/callback/<provider>, you must use <base-url>/self-service/methods/oidc/callback
+	// (Note the missing <provider> path segment and no trailing slash).
+	PKCE string `json:"pkce"`
+
+	// FedCMConfigURL is the URL to the FedCM IdP configuration file.
+	// This is only effective in the Ory Network.
+	FedCMConfigURL string `json:"fedcm_config_url"`
+
+	// NetIDTokenOriginHeader contains the orgin header to be used when exchanging a
+	// NetID FedCM token for an ID token.
+	NetIDTokenOriginHeader string `json:"net_id_token_origin_header"`
 }
 
 func (p Configuration) Redir(public *url.URL) string {
-	return urlx.AppendPaths(public,
-		strings.Replace(RouteCallback, ":provider", p.ID, 1),
-	).String()
+	if p.PKCE == "force" {
+		return urlx.AppendPaths(public, RouteCallbackGeneric).String()
+	}
+
+	if p.OrganizationID != "" {
+		route := RouteOrganizationCallback
+		route = strings.Replace(route, ":provider", p.ID, 1)
+		route = strings.Replace(route, ":organization", p.OrganizationID, 1)
+		return urlx.AppendPaths(public, route).String()
+	}
+
+	return urlx.AppendPaths(public, strings.Replace(RouteCallback, ":provider", p.ID, 1)).String()
 }
 
 type ConfigurationCollection struct {
@@ -108,55 +159,45 @@ type ConfigurationCollection struct {
 	Providers       []Configuration `json:"providers"`
 }
 
-func (c ConfigurationCollection) Provider(id string, reg dependencies) (Provider, error) {
-	for k := range c.Providers {
-		p := c.Providers[k]
+// !!! WARNING !!!
+//
+// If you add a provider here, please also add a test to
+// provider_private_net_test.go
+var supportedProviders = map[string]func(config *Configuration, reg Dependencies) Provider{
+	"generic":     NewProviderGenericOIDC,
+	"google":      NewProviderGoogle,
+	"github":      NewProviderGitHub,
+	"github-app":  NewProviderGitHubApp,
+	"gitlab":      NewProviderGitLab,
+	"microsoft":   NewProviderMicrosoft,
+	"discord":     NewProviderDiscord,
+	"salesforce":  NewProviderSalesforce,
+	"slack":       NewProviderSlack,
+	"facebook":    NewProviderFacebook,
+	"auth0":       NewProviderAuth0,
+	"vk":          NewProviderVK,
+	"yandex":      NewProviderYandex,
+	"apple":       NewProviderApple,
+	"spotify":     NewProviderSpotify,
+	"netid":       NewProviderNetID,
+	"dingtalk":    NewProviderDingTalk,
+	"linkedin":    NewProviderLinkedIn,
+	"linkedin_v2": NewProviderLinkedInV2,
+	"patreon":     NewProviderPatreon,
+	"lark":        NewProviderLark,
+	"x":           NewProviderX,
+	"jackson":     NewProviderJackson,
+	"fedcm-test":  NewProviderTestFedcm,
+}
+
+func (c ConfigurationCollection) Provider(id string, reg Dependencies) (Provider, error) {
+	for _, p := range c.Providers {
 		if p.ID == id {
-			var providerNames []string
-			var addProviderName = func(pn string) string {
-				providerNames = append(providerNames, pn)
-				return pn
+			if f, ok := supportedProviders[p.Provider]; ok {
+				return f(&p, reg), nil
 			}
 
-			// !!! WARNING !!!
-			//
-			// If you add a provider here, please also add a test to
-			// provider_private_net_test.go
-			switch p.Provider {
-			case addProviderName("generic"):
-				return NewProviderGenericOIDC(&p, reg), nil
-			case addProviderName("google"):
-				return NewProviderGoogle(&p, reg), nil
-			case addProviderName("github"):
-				return NewProviderGitHub(&p, reg), nil
-			case addProviderName("github-app"):
-				return NewProviderGitHubApp(&p, reg), nil
-			case addProviderName("gitlab"):
-				return NewProviderGitLab(&p, reg), nil
-			case addProviderName("microsoft"):
-				return NewProviderMicrosoft(&p, reg), nil
-			case addProviderName("discord"):
-				return NewProviderDiscord(&p, reg), nil
-			case addProviderName("slack"):
-				return NewProviderSlack(&p, reg), nil
-			case addProviderName("facebook"):
-				return NewProviderFacebook(&p, reg), nil
-			case addProviderName("auth0"):
-				return NewProviderAuth0(&p, reg), nil
-			case addProviderName("vk"):
-				return NewProviderVK(&p, reg), nil
-			case addProviderName("yandex"):
-				return NewProviderYandex(&p, reg), nil
-			case addProviderName("apple"):
-				return NewProviderApple(&p, reg), nil
-			case addProviderName("spotify"):
-				return NewProviderSpotify(&p, reg), nil
-			case addProviderName("netid"):
-				return NewProviderNetID(&p, reg), nil
-			case addProviderName("dingtalk"):
-				return NewProviderDingTalk(&p, reg), nil
-			}
-			return nil, errors.Errorf("provider type %s is not supported, supported are: %v", p.Provider, providerNames)
+			return nil, errors.Errorf("provider type %s is not supported, supported are: %v", p.Provider, maps.Keys(supportedProviders))
 		}
 	}
 	return nil, errors.WithStack(herodot.ErrNotFound.WithReasonf(`OpenID Connect Provider "%s" is unknown or has not been configured`, id))

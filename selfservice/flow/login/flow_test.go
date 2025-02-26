@@ -1,6 +1,10 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package login_test
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net/http"
@@ -8,15 +12,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/uuid"
+
 	"github.com/tidwall/gjson"
 
-	"github.com/ory/x/jsonx"
-
+	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
+	"github.com/ory/x/jsonx"
+	"github.com/ory/x/sqlxx"
 
 	"github.com/ory/kratos/internal"
 
-	"github.com/bxcodec/faker/v3"
+	"github.com/go-faker/faker/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -28,10 +35,11 @@ import (
 )
 
 func TestFakeFlow(t *testing.T) {
+	t.Parallel()
 	var r login.Flow
 	require.NoError(t, faker.FakeData(&r))
 
-	assert.NotEmpty(t, r.ID)
+	assert.Equal(t, uuid.Nil, r.ID)
 	assert.NotEmpty(t, r.IssuedAt)
 	assert.NotEmpty(t, r.ExpiresAt)
 	assert.NotEmpty(t, r.RequestURL)
@@ -40,6 +48,8 @@ func TestFakeFlow(t *testing.T) {
 }
 
 func TestNewFlow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
 	conf, _ := internal.NewFastRegistryWithMocks(t)
 
 	t.Run("type=aal", func(t *testing.T) {
@@ -54,11 +64,29 @@ func TestNewFlow(t *testing.T) {
 		assert.Equal(t, identity.AuthenticatorAssuranceLevel1, r.RequestedAAL)
 	})
 
+	t.Run("type=refresh", func(t *testing.T) {
+		t.Run("case=refresh accepts any truthy value", func(t *testing.T) {
+			parameters := []string{"true", "True", "1"}
+
+			for _, refresh := range parameters {
+				r, err := login.NewFlow(conf, 0, "csrf", &http.Request{URL: &url.URL{Path: "/", RawQuery: fmt.Sprintf("refresh=%v", refresh)}, Host: "ory.sh"}, flow.TypeBrowser)
+				require.NoError(t, err)
+				assert.True(t, r.Refresh)
+			}
+		})
+
+		t.Run("case=refresh silently ignores invalid values", func(t *testing.T) {
+			r, err := login.NewFlow(conf, 0, "csrf", &http.Request{URL: &url.URL{Path: "/", RawQuery: "refresh=foo"}, Host: "ory.sh"}, flow.TypeBrowser)
+			require.NoError(t, err)
+			assert.False(t, r.Refresh)
+		})
+	})
+
 	t.Run("type=return_to", func(t *testing.T) {
 		_, err := login.NewFlow(conf, 0, "csrf", &http.Request{URL: &url.URL{Path: "/", RawQuery: "return_to=https://not-allowed/foobar"}, Host: "ory.sh"}, flow.TypeBrowser)
 		require.Error(t, err)
 
-		_, err = login.NewFlow(conf, 0, "csrf", &http.Request{URL: &url.URL{Path: "/", RawQuery: "return_to=" + urlx.AppendPaths(conf.SelfPublicURL(), "/self-service/login/browser").String()}, Host: "ory.sh"}, flow.TypeBrowser)
+		_, err = login.NewFlow(conf, 0, "csrf", &http.Request{URL: &url.URL{Path: "/", RawQuery: "return_to=" + urlx.AppendPaths(conf.SelfPublicURL(ctx), "/self-service/login/browser").String()}, Host: "ory.sh"}, flow.TypeBrowser)
 		require.NoError(t, err)
 	})
 
@@ -78,7 +106,8 @@ func TestNewFlow(t *testing.T) {
 		t.Run("case=regular flow creation", func(t *testing.T) {
 			r, err := login.NewFlow(conf, 0, "csrf", &http.Request{
 				URL:  urlx.ParseOrPanic("https://ory.sh/"),
-				Host: "ory.sh"}, flow.TypeBrowser)
+				Host: "ory.sh",
+			}, flow.TypeBrowser)
 			require.NoError(t, err)
 			assert.Equal(t, "https://ory.sh/", r.RequestURL)
 		})
@@ -88,7 +117,8 @@ func TestNewFlow(t *testing.T) {
 		t.Run("case=flow with refresh", func(t *testing.T) {
 			r, err := login.NewFlow(conf, 0, "csrf", &http.Request{
 				URL:  urlx.ParseOrPanic("/?refresh=true"),
-				Host: "ory.sh"}, flow.TypeAPI)
+				Host: "ory.sh",
+			}, flow.TypeAPI)
 			require.NoError(t, err)
 			assert.Equal(t, r.IssuedAt, r.ExpiresAt)
 			assert.Equal(t, flow.TypeAPI, r.Type)
@@ -99,7 +129,8 @@ func TestNewFlow(t *testing.T) {
 		t.Run("case=flow without refresh", func(t *testing.T) {
 			r, err := login.NewFlow(conf, 0, "csrf", &http.Request{
 				URL:  urlx.ParseOrPanic("/"),
-				Host: "ory.sh"}, flow.TypeAPI)
+				Host: "ory.sh",
+			}, flow.TypeAPI)
 			require.NoError(t, err)
 			assert.Equal(t, r.IssuedAt, r.ExpiresAt)
 			assert.Equal(t, flow.TypeAPI, r.Type)
@@ -107,9 +138,21 @@ func TestNewFlow(t *testing.T) {
 			assert.Equal(t, "http://ory.sh/", r.RequestURL)
 		})
 	})
+
+	t.Run("should parse login_challenge when Hydra is configured", func(t *testing.T) {
+		_, err := login.NewFlow(conf, 0, "csrf", &http.Request{URL: urlx.ParseOrPanic("https://ory.sh/?login_challenge=badee1"), Host: "ory.sh"}, flow.TypeBrowser)
+		require.Error(t, err)
+
+		conf.MustSet(ctx, config.ViperKeyOAuth2ProviderURL, "https://hydra")
+
+		r, err := login.NewFlow(conf, 0, "csrf", &http.Request{URL: urlx.ParseOrPanic("https://ory.sh/?login_challenge=8aadcb8fc1334186a84c4da9813356d9"), Host: "ory.sh"}, flow.TypeBrowser)
+		require.NoError(t, err)
+		assert.Equal(t, "8aadcb8fc1334186a84c4da9813356d9", string(r.OAuth2LoginChallenge))
+	})
 }
 
 func TestFlow(t *testing.T) {
+	t.Parallel()
 	r := &login.Flow{ID: x.NewUUID()}
 	assert.Equal(t, r.ID, r.GetID())
 
@@ -134,6 +177,7 @@ func TestFlow(t *testing.T) {
 }
 
 func TestGetType(t *testing.T) {
+	t.Parallel()
 	for _, ft := range []flow.Type{
 		flow.TypeAPI,
 		flow.TypeBrowser,
@@ -146,13 +190,52 @@ func TestGetType(t *testing.T) {
 }
 
 func TestGetRequestURL(t *testing.T) {
+	t.Parallel()
 	expectedURL := "http://foo/bar/baz"
 	f := &login.Flow{RequestURL: expectedURL}
 	assert.Equal(t, expectedURL, f.GetRequestURL())
 }
 
 func TestFlowEncodeJSON(t *testing.T) {
+	t.Parallel()
 	assert.EqualValues(t, "", gjson.Get(jsonx.TestMarshalJSONString(t, &login.Flow{RequestURL: "https://foo.bar?foo=bar"}), "return_to").String())
 	assert.EqualValues(t, "/bar", gjson.Get(jsonx.TestMarshalJSONString(t, &login.Flow{RequestURL: "https://foo.bar?return_to=/bar"}), "return_to").String())
 	assert.EqualValues(t, "/bar", gjson.Get(jsonx.TestMarshalJSONString(t, login.Flow{RequestURL: "https://foo.bar?return_to=/bar"}), "return_to").String())
+}
+
+func TestFlowDontOverrideReturnTo(t *testing.T) {
+	t.Parallel()
+	f := &login.Flow{ReturnTo: "/foo"}
+	f.SetReturnTo()
+	assert.Equal(t, "/foo", f.ReturnTo)
+
+	f = &login.Flow{RequestURL: "https://foo.bar?return_to=/bar"}
+	f.SetReturnTo()
+	assert.Equal(t, "/bar", f.ReturnTo)
+}
+
+func TestDuplicateCredentials(t *testing.T) {
+	t.Parallel()
+	t.Run("case=returns previous data", func(t *testing.T) {
+		t.Parallel()
+		f := new(login.Flow)
+		dc := flow.DuplicateCredentialsData{
+			CredentialsType:     "foo",
+			CredentialsConfig:   sqlxx.JSONRawMessage(`{"bar":"baz"}`),
+			DuplicateIdentifier: "bar",
+		}
+
+		require.NoError(t, flow.SetDuplicateCredentials(f, dc))
+		actual, err := flow.DuplicateCredentials(f)
+		require.NoError(t, err)
+		assert.Equal(t, dc, *actual)
+	})
+
+	t.Run("case=returns nil data", func(t *testing.T) {
+		t.Parallel()
+		f := new(login.Flow)
+		actual, err := flow.DuplicateCredentials(f)
+		require.NoError(t, err)
+		assert.Nil(t, actual)
+	})
 }

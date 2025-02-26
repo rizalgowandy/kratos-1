@@ -1,17 +1,20 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package test
 
 import (
 	"context"
 	"testing"
 
-	"github.com/bxcodec/faker/v3"
+	"github.com/go-faker/faker/v4"
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/internal/testhelpers"
 	"github.com/ory/kratos/persistence"
+	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/recovery"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
@@ -19,26 +22,27 @@ import (
 	"github.com/ory/x/sqlcon"
 )
 
-func TestFlowPersister(ctx context.Context, conf *config.Config, p interface {
+func TestFlowPersister(ctx context.Context, p interface {
 	persistence.Persister
-}) func(t *testing.T) {
-	var clearids = func(r *recovery.Flow) {
+},
+) func(t *testing.T) {
+	clearids := func(r *recovery.Flow) {
 		r.ID = uuid.UUID{}
 	}
 
 	return func(t *testing.T) {
 		nid, p := testhelpers.NewNetworkUnlessExisting(t, ctx, p)
-		testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/identity.schema.json")
 
 		t.Run("case=should error when the recovery request does not exist", func(t *testing.T) {
 			_, err := p.GetRecoveryFlow(ctx, x.NewUUID())
 			require.Error(t, err)
 		})
 
-		var newFlow = func(t *testing.T) *recovery.Flow {
+		newFlow := func(t *testing.T) *recovery.Flow {
 			var r recovery.Flow
 			require.NoError(t, faker.FakeData(&r))
 			clearids(&r)
+			r.State = flow.StateShowForm
 			return &r
 		}
 
@@ -58,6 +62,7 @@ func TestFlowPersister(ctx context.Context, conf *config.Config, p interface {
 		t.Run("case=should create with set ids", func(t *testing.T) {
 			var r recovery.Flow
 			require.NoError(t, faker.FakeData(&r))
+			r.State = flow.StateShowForm
 			require.NoError(t, p.CreateRecoveryFlow(ctx, &r))
 			require.Equal(t, nid, r.NID)
 
@@ -159,7 +164,6 @@ func TestFlowPersister(ctx context.Context, conf *config.Config, p interface {
 		})
 
 		t.Run("case=handle network reference issues", func(t *testing.T) {
-
 		})
 	}
 }

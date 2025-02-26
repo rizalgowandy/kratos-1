@@ -1,68 +1,73 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package courier
 
 import (
 	"context"
 	"time"
 
-	"github.com/ory/kratos/courier/template"
+	"github.com/ory/x/jsonnetsecure"
 
 	"github.com/cenkalti/backoff"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 
+	"github.com/ory/kratos/courier/template"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/x"
-	gomail "github.com/ory/mail/v3"
 )
 
 type (
 	Dependencies interface {
 		PersistenceProvider
+		x.TracingProvider
 		x.LoggingProvider
 		ConfigProvider
 		x.HTTPClientProvider
+		jsonnetsecure.VMProvider
 	}
 
 	Courier interface {
 		Work(ctx context.Context) error
 		QueueEmail(ctx context.Context, t EmailTemplate) (uuid.UUID, error)
 		QueueSMS(ctx context.Context, t SMSTemplate) (uuid.UUID, error)
-		SmtpDialer() *gomail.Dialer
 		DispatchQueue(ctx context.Context) error
 		DispatchMessage(ctx context.Context, msg Message) error
-		SetGetEmailTemplateType(f func(t EmailTemplate) (TemplateType, error))
-		SetNewEmailTemplateFromMessage(f func(d template.Dependencies, msg Message) (EmailTemplate, error))
 		UseBackoff(b backoff.BackOff)
+		FailOnDispatchError()
 	}
 
 	Provider interface {
-		Courier(ctx context.Context) Courier
+		Courier(ctx context.Context) (Courier, error)
 	}
 
 	ConfigProvider interface {
-		CourierConfig(ctx context.Context) config.CourierConfigs
+		CourierConfig() config.CourierConfigs
 	}
 
 	courier struct {
-		smsClient   *smsClient
-		smtpClient  *smtpClient
-		deps        Dependencies
-		failOnError bool
-		backoff     backoff.BackOff
+		deps                        Dependencies
+		failOnDispatchError         bool
+		backoff                     backoff.BackOff
+		newEmailTemplateFromMessage func(d template.Dependencies, msg Message) (EmailTemplate, error)
 	}
 )
 
-func NewCourier(ctx context.Context, deps Dependencies) Courier {
+func NewCourier(ctx context.Context, deps Dependencies) (Courier, error) {
+	return NewCourierWithCustomTemplates(ctx, deps, NewEmailTemplateFromMessage)
+}
+
+func NewCourierWithCustomTemplates(_ context.Context, deps Dependencies, newEmailTemplateFromMessage func(d template.Dependencies, msg Message) (EmailTemplate, error)) (Courier, error) {
 	return &courier{
-		smsClient:  newSMS(ctx, deps),
-		smtpClient: newSMTP(ctx, deps),
-		deps:       deps,
-		backoff:    backoff.NewExponentialBackOff(),
-	}
+		deps:                        deps,
+		backoff:                     backoff.NewExponentialBackOff(),
+		newEmailTemplateFromMessage: newEmailTemplateFromMessage,
+	}, nil
 }
 
 func (c *courier) FailOnDispatchError() {
-	c.failOnError = true
+	c.failOnDispatchError = true
 }
 
 func (c *courier) Work(ctx context.Context) error {
@@ -87,6 +92,7 @@ func (c *courier) UseBackoff(b backoff.BackOff) {
 }
 
 func (c *courier) watchMessages(ctx context.Context, errChan chan error) {
+	wait := c.deps.CourierConfig().CourierWorkerPullWait(ctx)
 	c.backoff.Reset()
 	for {
 		if err := backoff.Retry(func() error {
@@ -95,6 +101,6 @@ func (c *courier) watchMessages(ctx context.Context, errChan chan error) {
 			errChan <- err
 			return
 		}
-		time.Sleep(time.Second)
+		time.Sleep(wait)
 	}
 }

@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package registration_test
 
 import (
@@ -8,32 +11,41 @@ import (
 	"time"
 
 	"github.com/gobuffalo/httptest"
+	"github.com/gofrs/uuid"
 	"github.com/julienschmidt/httprouter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/hydra"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/internal"
 	"github.com/ory/kratos/internal/testhelpers"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/registration"
+	"github.com/ory/kratos/selfservice/hook"
 	"github.com/ory/kratos/x"
 )
 
 func TestRegistrationExecutor(t *testing.T) {
-	for _, strategy := range []string{
-		identity.CredentialsTypePassword.String(),
-		identity.CredentialsTypeOIDC.String(),
-	} {
-		t.Run("strategy="+strategy, func(t *testing.T) {
-			conf, reg := internal.NewFastRegistryWithMocks(t)
-			testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/registration.schema.json")
-			conf.MustSet(config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh/")
+	t.Parallel()
+	ctx := context.Background()
 
-			newServer := func(t *testing.T, i *identity.Identity, ft flow.Type) *httptest.Server {
+	for _, strategy := range identity.AllCredentialTypes {
+		strategy := strategy.String()
+
+		t.Run("strategy="+strategy, func(t *testing.T) {
+			t.Parallel()
+
+			conf, reg := internal.NewFastRegistryWithMocks(t)
+			reg.WithHydra(hydra.NewFake())
+			testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/registration.schema.json")
+			conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh/")
+
+			newServer := func(t *testing.T, i *identity.Identity, ft flow.Type, flowCallbacks ...func(*registration.Flow)) *httptest.Server {
 				router := httprouter.New()
+
 				handleErr := testhelpers.SelfServiceHookRegistrationErrorHandler
 				router.GET("/registration/pre", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 					f, err := registration.NewFlow(conf, time.Minute, x.FakeCSRFToken, r, ft)
@@ -47,15 +59,18 @@ func TestRegistrationExecutor(t *testing.T) {
 					if i == nil {
 						i = testhelpers.SelfServiceHookFakeIdentity(t)
 					}
-					a, err := registration.NewFlow(conf, time.Minute, x.FakeCSRFToken, r, ft)
+					regFlow, err := registration.NewFlow(conf, time.Minute, x.FakeCSRFToken, r, ft)
 					require.NoError(t, err)
-					a.RequestURL = x.RequestURL(r).String()
-					_ = handleErr(t, w, r, reg.RegistrationHookExecutor().PostRegistrationHook(w, r, identity.CredentialsType(strategy), a, i))
+					regFlow.RequestURL = x.RequestURL(r).String()
+					for _, callback := range flowCallbacks {
+						callback(regFlow)
+					}
+					_ = handleErr(t, w, r, reg.RegistrationHookExecutor().PostRegistrationHook(w, r, identity.CredentialsType(strategy), "", "", regFlow, i))
 				})
 
 				ts := httptest.NewServer(router)
 				t.Cleanup(ts.Close)
-				conf.MustSet(config.ViperKeyPublicBaseURL, ts.URL)
+				conf.MustSet(ctx, config.ViperKeyPublicBaseURL, ts.URL)
 				return ts
 			}
 
@@ -71,7 +86,22 @@ func TestRegistrationExecutor(t *testing.T) {
 					assert.EqualValues(t, http.StatusOK, res.StatusCode)
 					assert.EqualValues(t, "https://www.ory.sh/", res.Request.URL.String())
 
-					actual, err := reg.IdentityPool().GetIdentity(context.Background(), i.ID)
+					actual, err := reg.IdentityPool().GetIdentity(context.Background(), i.ID, identity.ExpandNothing)
+					require.NoError(t, err)
+					assert.Equal(t, actual.Traits, i.Traits)
+				})
+
+				t.Run("case=pass without hooks if ajax client", func(t *testing.T) {
+					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
+					i := testhelpers.SelfServiceHookFakeIdentity(t)
+
+					ts := newServer(t, i, flow.TypeBrowser)
+					res, body := makeRequestPost(t, ts, true, url.Values{})
+					assert.EqualValues(t, http.StatusOK, res.StatusCode)
+					assert.Contains(t, res.Request.URL.String(), ts.URL)
+					assert.EqualValues(t, gjson.Get(body, "continue_with").Raw, `[{"action":"redirect_browser_to","redirect_browser_to":"https://www.ory.sh/"}]`)
+
+					actual, err := reg.IdentityPool().GetIdentity(context.Background(), i.ID, identity.ExpandNothing)
 					require.NoError(t, err)
 					assert.Equal(t, actual.Traits, i.Traits)
 				})
@@ -94,13 +124,13 @@ func TestRegistrationExecutor(t *testing.T) {
 					assert.EqualValues(t, http.StatusOK, res.StatusCode)
 					assert.Equal(t, "", body)
 
-					_, err := reg.IdentityPool().GetIdentity(context.Background(), i.ID)
+					_, err := reg.IdentityPool().GetIdentity(context.Background(), i.ID, identity.ExpandNothing)
 					require.Error(t, err)
 				})
 
 				t.Run("case=use return_to value", func(t *testing.T) {
 					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
-					conf.MustSet(config.ViperKeyURLsAllowedReturnToDomains, []string{"https://www.ory.sh/"})
+					conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{"https://www.ory.sh/"})
 
 					res, _ := makeRequestPost(t, newServer(t, nil, flow.TypeBrowser), false, url.Values{"return_to": {"https://www.ory.sh/kratos/"}})
 					assert.EqualValues(t, http.StatusOK, res.StatusCode)
@@ -118,7 +148,7 @@ func TestRegistrationExecutor(t *testing.T) {
 
 				t.Run("case=use nested config value", func(t *testing.T) {
 					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
-					conf.MustSet(config.ViperKeyURLsAllowedReturnToDomains, []string{"https://www.ory.sh/kratos"})
+					conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{"https://www.ory.sh/kratos"})
 					testhelpers.SelfServiceHookRegistrationSetDefaultRedirectTo(t, conf, "https://www.ory.sh/not-kratos")
 					testhelpers.SelfServiceHookRegistrationSetDefaultRedirectToStrategy(t, conf, strategy, "https://www.ory.sh/kratos")
 
@@ -153,25 +183,109 @@ func TestRegistrationExecutor(t *testing.T) {
 					assert.Empty(t, gjson.Get(body, "session.token"))
 					assert.Empty(t, gjson.Get(body, "session_token"))
 				})
+
+				t.Run("case=should redirect to verification UI if show_verification_ui hook is set", func(t *testing.T) {
+					verificationTS := testhelpers.NewVerificationUIFlowEchoServer(t, reg)
+					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
+					conf.MustSet(ctx, config.ViperKeySelfServiceVerificationEnabled, true)
+					conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationAfter+".hooks", []map[string]interface{}{
+						{
+							"hook": hook.KeyVerificationUI,
+						},
+					})
+					i := testhelpers.SelfServiceHookFakeIdentity(t)
+					i.Traits = identity.Traits(`{"email": "verifiable@ory.sh"}`)
+
+					res, _ := makeRequestPost(t, newServer(t, i, flow.TypeBrowser), false, url.Values{})
+					assert.EqualValues(t, http.StatusOK, res.StatusCode)
+					assert.Contains(t, res.Request.URL.String(), verificationTS.URL)
+					assert.NotEmpty(t, res.Request.URL.Query().Get("flow"))
+				})
+
+				t.Run("case=should redirect to verification UI if there is a login_challenge", func(t *testing.T) {
+					verificationTS := testhelpers.NewVerificationUIFlowEchoServer(t, reg)
+					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
+					conf.MustSet(ctx, config.ViperKeySelfServiceVerificationEnabled, true)
+					conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationAfter+".hooks", []map[string]interface{}{{
+						"hook": hook.KeyVerificationUI,
+					}})
+					i := testhelpers.SelfServiceHookFakeIdentity(t)
+					i.Traits = identity.Traits(`{"email": "verifiable-valid-login_challenge@ory.sh"}`)
+
+					withOAuthChallenge := func(f *registration.Flow) {
+						f.OAuth2LoginChallenge = hydra.FakeValidLoginChallenge
+					}
+					res, _ := makeRequestPost(t, newServer(t, i, flow.TypeBrowser, withOAuthChallenge), false, url.Values{})
+					assert.EqualValues(t, http.StatusOK, res.StatusCode)
+					assert.Contains(t, res.Request.URL.String(), verificationTS.URL)
+					flowID := res.Request.URL.Query().Get("flow")
+					require.NotEmpty(t, flowID)
+					flow, err := reg.VerificationFlowPersister().GetVerificationFlow(ctx, uuid.Must(uuid.FromString(flowID)))
+					require.NoError(t, err)
+					assert.Equal(t, hydra.FakeValidLoginChallenge, flow.OAuth2LoginChallenge.String())
+				})
+
+				t.Run("case=should redirect to first verification UI if show_verification_ui hook is set and multiple verifiable addresses", func(t *testing.T) {
+					verificationTS := testhelpers.NewVerificationUIFlowEchoServer(t, reg)
+					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
+					conf.MustSet(ctx, config.ViperKeySelfServiceVerificationEnabled, true)
+					conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationAfter+".hooks", []map[string]interface{}{
+						{
+							"hook": hook.KeyVerificationUI,
+						},
+					})
+
+					i := testhelpers.SelfServiceHookFakeIdentity(t)
+					i.SchemaID = testhelpers.UseIdentitySchema(t, conf, "file://./stub/registration-multi-email.schema.json")
+					i.Traits = identity.Traits(`{"emails": ["one@ory.sh", "two@ory.sh"]}`)
+
+					res, _ := makeRequestPost(t, newServer(t, i, flow.TypeBrowser), false, url.Values{})
+					assert.EqualValues(t, http.StatusOK, res.StatusCode)
+					assert.Contains(t, res.Request.URL.String(), verificationTS.URL)
+					assert.NotEmpty(t, res.Request.URL.Query().Get("flow"))
+				})
+
+				t.Run("case=should still sent session if show_verification_ui is set after session hook", func(t *testing.T) {
+					verificationTS := testhelpers.NewVerificationUIFlowEchoServer(t, reg)
+					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
+					conf.MustSet(ctx, config.ViperKeySelfServiceVerificationEnabled, true)
+					conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationAfter+".hooks", []map[string]interface{}{
+						{
+							"hook": hook.KeyVerificationUI,
+						},
+						{
+							"hook": hook.KeySessionIssuer,
+						},
+					})
+
+					i := testhelpers.SelfServiceHookFakeIdentity(t)
+					i.Traits = identity.Traits(`{"email": "verifiable4@ory.sh"}`)
+
+					jar := testhelpers.EasyCookieJar(t, nil)
+					s := newServer(t, i, flow.TypeBrowser)
+					s.Client().Jar = jar
+					res, _ := makeRequestPost(t, s, false, url.Values{})
+					assert.EqualValues(t, http.StatusOK, res.StatusCode)
+					assert.Contains(t, res.Request.URL.String(), verificationTS.URL)
+					assert.NotEmpty(t, res.Request.URL.Query().Get("flow"))
+					u, err := url.Parse(s.URL)
+					require.NoError(t, err)
+					cookies := jar.Cookies(u)
+					require.Len(t, cookies, 1)
+					assert.Equal(t, "ory_kratos_session", cookies[0].Name)
+				})
 			})
 
-			t.Run("type=browser/method=PreRegistrationHook", testhelpers.TestSelfServicePreHook(
-				config.ViperKeySelfServiceRegistrationBeforeHooks,
-				testhelpers.SelfServiceMakeRegistrationPreHookRequest,
-				func(t *testing.T) *httptest.Server {
-					return newServer(t, nil, flow.TypeBrowser)
-				},
-				conf,
-			))
-
-			t.Run("type=api/method=PreRegistrationHook", testhelpers.TestSelfServicePreHook(
-				config.ViperKeySelfServiceRegistrationBeforeHooks,
-				testhelpers.SelfServiceMakeRegistrationPreHookRequest,
-				func(t *testing.T) *httptest.Server {
-					return newServer(t, nil, flow.TypeAPI)
-				},
-				conf,
-			))
+			for _, kind := range []flow.Type{flow.TypeBrowser, flow.TypeAPI} {
+				t.Run("type="+string(kind)+"/method=PreRegistrationHook", testhelpers.TestSelfServicePreHook(
+					config.ViperKeySelfServiceRegistrationBeforeHooks,
+					testhelpers.SelfServiceMakeRegistrationPreHookRequest,
+					func(t *testing.T) *httptest.Server {
+						return newServer(t, nil, kind)
+					},
+					conf,
+				))
+			}
 		})
 	}
 }

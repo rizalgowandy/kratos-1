@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package lookup_test
 
 import (
@@ -14,7 +17,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	kratos "github.com/ory/kratos-client-go"
+	kratos "github.com/ory/kratos/internal/httpclient"
 	"github.com/ory/kratos/selfservice/flow"
 
 	"github.com/stretchr/testify/assert"
@@ -42,18 +45,18 @@ func createIdentityWithoutLookup(t *testing.T, reg driver.Registry) *identity.Id
 	return id
 }
 
-func createIdentity(t *testing.T, reg driver.Registry) (*identity.Identity, []lookup.RecoveryCode) {
-	codes := make([]lookup.RecoveryCode, 12)
+func createIdentity(t *testing.T, reg driver.Registry) (*identity.Identity, []identity.RecoveryCode) {
+	codes := make([]identity.RecoveryCode, 12)
 	for k := range codes {
 		var usedAt sqlxx.NullTime
 		if k%3 == 1 {
 			usedAt = sqlxx.NullTime(time.Unix(int64(1629199958+k), 0))
 		}
-		codes[k] = lookup.RecoveryCode{Code: fmt.Sprintf("key-%d", k), UsedAt: usedAt}
+		codes[k] = identity.RecoveryCode{Code: fmt.Sprintf("key-%d", k), UsedAt: usedAt}
 	}
 	identifier := x.NewUUID().String() + "@ory.sh"
 	password := x.NewUUID().String()
-	p, err := reg.Hasher().Generate(context.Background(), []byte(password))
+	p, err := reg.Hasher(context.Background()).Generate(context.Background(), []byte(password))
 	require.NoError(t, err)
 	i := &identity.Identity{
 		Traits: identity.Traits(fmt.Sprintf(`{"subject":"%s"}`, identifier)),
@@ -66,7 +69,7 @@ func createIdentity(t *testing.T, reg driver.Registry) (*identity.Identity, []lo
 		},
 	}
 
-	rc, err := json.Marshal(&lookup.CredentialsConfig{RecoveryCodes: codes})
+	rc, err := json.Marshal(&identity.CredentialsLookupConfig{RecoveryCodes: codes})
 	require.NoError(t, err)
 	require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), i))
 	i.Credentials = map[identity.CredentialsType]identity.Credentials{
@@ -87,11 +90,12 @@ func createIdentity(t *testing.T, reg driver.Registry) (*identity.Identity, []lo
 }
 
 func TestCompleteSettings(t *testing.T) {
+	ctx := context.Background()
 	conf, reg := internal.NewFastRegistryWithMocks(t)
-	conf.MustSet(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword)+".enabled", false)
-	conf.MustSet(config.ViperKeySelfServiceStrategyConfig+".profile.enabled", false)
-	conf.MustSet(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeLookup)+".enabled", true)
-	conf.MustSet(config.ViperKeySelfServiceSettingsRequiredAAL, "aal1")
+	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword)+".enabled", false)
+	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+".profile.enabled", false)
+	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeLookup)+".enabled", true)
+	conf.MustSet(ctx, config.ViperKeySelfServiceSettingsRequiredAAL, "aal1")
 
 	router := x.NewRouterPublic()
 	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin())
@@ -101,13 +105,13 @@ func TestCompleteSettings(t *testing.T) {
 	_ = testhelpers.NewRedirSessionEchoTS(t, reg)
 	loginTS := testhelpers.NewLoginUIFlowEchoServer(t, reg)
 
-	conf.MustSet(config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "1m")
+	conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "1m")
 
 	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/login.schema.json")
-	conf.MustSet(config.ViperKeySecretsDefault, []string{"not-a-secure-session-key"})
+	conf.MustSet(ctx, config.ViperKeySecretsDefault, []string{"not-a-secure-session-key"})
 
 	doAPIFlow := func(t *testing.T, v func(url.Values), id *identity.Identity) (string, *http.Response) {
-		apiClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, reg, id)
+		apiClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id)
 		f := testhelpers.InitializeSettingsFlowViaAPI(t, apiClient, publicTS)
 		values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
 		v(values)
@@ -116,7 +120,7 @@ func TestCompleteSettings(t *testing.T) {
 	}
 
 	doBrowserFlow := func(t *testing.T, spa bool, v func(url.Values), id *identity.Identity) (string, *http.Response) {
-		browserClient := testhelpers.NewHTTPClientWithIdentitySessionCookie(t, reg, id)
+		browserClient := testhelpers.NewHTTPClientWithIdentitySessionCookie(t, ctx, reg, id)
 		f := testhelpers.InitializeSettingsFlowViaBrowser(t, browserClient, spa, publicTS)
 		values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
 		v(values)
@@ -125,7 +129,7 @@ func TestCompleteSettings(t *testing.T) {
 
 	t.Run("case=hide recovery codes behind reveal button and show disable button", func(t *testing.T) {
 		id, _ := createIdentity(t, reg)
-		browserClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, reg, id)
+		browserClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id)
 
 		t.Run("case=spa", func(t *testing.T) {
 			f := testhelpers.InitializeSettingsFlowViaBrowser(t, browserClient, true, publicTS)
@@ -138,7 +142,7 @@ func TestCompleteSettings(t *testing.T) {
 		})
 
 		t.Run("case=api", func(t *testing.T) {
-			apiClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, reg, id)
+			apiClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id)
 			f := testhelpers.InitializeSettingsFlowViaAPI(t, apiClient, publicTS)
 			testhelpers.SnapshotTExcept(t, f.Ui.Nodes, []string{"0.attributes.value"})
 		})
@@ -146,7 +150,7 @@ func TestCompleteSettings(t *testing.T) {
 
 	t.Run("case=button for regeneration is displayed when identity has no recovery codes yet", func(t *testing.T) {
 		id := createIdentityWithoutLookup(t, reg)
-		browserClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, reg, id)
+		browserClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id)
 
 		t.Run("case=spa", func(t *testing.T) {
 			f := testhelpers.InitializeSettingsFlowViaBrowser(t, browserClient, true, publicTS)
@@ -159,7 +163,7 @@ func TestCompleteSettings(t *testing.T) {
 		})
 
 		t.Run("case=api", func(t *testing.T) {
-			apiClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, reg, id)
+			apiClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id)
 			f := testhelpers.InitializeSettingsFlowViaAPI(t, apiClient, publicTS)
 			testhelpers.SnapshotTExcept(t, f.Ui.Nodes, []string{"0.attributes.value"})
 		})
@@ -202,9 +206,9 @@ func TestCompleteSettings(t *testing.T) {
 	})
 
 	t.Run("type=can not reveal or regenerate or remove without privileged session", func(t *testing.T) {
-		conf.MustSet(config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "1ns")
+		conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "1ns")
 		t.Cleanup(func() {
-			conf.MustSet(config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "5m")
+			conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "5m")
 		})
 
 		id, codes := createIdentity(t, reg)
@@ -269,7 +273,7 @@ func TestCompleteSettings(t *testing.T) {
 
 	t.Run("type=can not confirm without regenerate", func(t *testing.T) {
 		id, codes := createIdentity(t, reg)
-		var payload = func(v url.Values) {
+		payload := func(v url.Values) {
 			v.Set(node.LookupConfirm, "true")
 		}
 
@@ -306,7 +310,7 @@ func TestCompleteSettings(t *testing.T) {
 
 	t.Run("type=regenerate but no confirmation", func(t *testing.T) {
 		id, codes := createIdentity(t, reg)
-		var payload = func(v url.Values) {
+		payload := func(v url.Values) {
 			v.Set(node.LookupRegenerate, "true")
 		}
 
@@ -359,20 +363,20 @@ func TestCompleteSettings(t *testing.T) {
 			},
 		} {
 			t.Run("credentials="+tc.d, func(t *testing.T) {
-				var payload = func(v url.Values) {
+				payload := func(v url.Values) {
 					v.Del(node.LookupReveal)
 					v.Del(node.LookupDisable)
 					v.Set(node.LookupRegenerate, "true")
 				}
 
-				var payloadConfirm = func(v url.Values) {
+				payloadConfirm := func(v url.Values) {
 					v.Del(node.LookupRegenerate)
 					v.Del(node.LookupDisable)
 					v.Del(node.LookupReveal)
 					v.Set(node.LookupConfirm, "true")
 				}
 
-				checkIdentity := func(t *testing.T, id *identity.Identity, f *kratos.SelfServiceSettingsFlow) {
+				checkIdentity := func(t *testing.T, id *identity.Identity, f *kratos.SettingsFlow) {
 					_, cred, err := reg.PrivilegedIdentityPool().FindByCredentialsIdentifier(context.Background(), identity.CredentialsTypeLookup, id.ID.String())
 					require.NoError(t, err)
 					assert.NotContains(t, gjson.GetBytes(cred.Config, "recovery_codes").Raw, "key-1")
@@ -385,7 +389,7 @@ func TestCompleteSettings(t *testing.T) {
 
 				t.Run("type=api", func(t *testing.T) {
 					id, _ := createIdentity(t, reg)
-					apiClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, reg, id)
+					apiClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id)
 					f := testhelpers.InitializeSettingsFlowViaAPI(t, apiClient, publicTS)
 					values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
 
@@ -394,10 +398,10 @@ func TestCompleteSettings(t *testing.T) {
 
 					payloadConfirm(values)
 					actual, res := testhelpers.SettingsMakeRequest(t, true, false, f, apiClient, testhelpers.EncodeFormAsJSON(t, true, values))
-					assert.Equal(t, http.StatusOK, res.StatusCode)
+					require.Equal(t, http.StatusOK, res.StatusCode)
 
 					assert.Contains(t, res.Request.URL.String(), publicTS.URL+settings.RouteSubmitFlow)
-					assert.EqualValues(t, settings.StateSuccess, json.RawMessage(gjson.Get(actual, "state").String()))
+					assert.EqualValues(t, flow.StateSuccess, json.RawMessage(gjson.Get(actual, "state").String()))
 
 					checkIdentity(t, id, f)
 					testhelpers.EnsureAAL(t, apiClient, publicTS, "aal2", string(identity.CredentialsTypeLookup))
@@ -406,7 +410,7 @@ func TestCompleteSettings(t *testing.T) {
 				runBrowser := func(t *testing.T, spa bool) {
 					id, _ := createIdentity(t, reg)
 
-					browserClient := testhelpers.NewHTTPClientWithIdentitySessionCookie(t, reg, id)
+					browserClient := testhelpers.NewHTTPClientWithIdentitySessionCookie(t, ctx, reg, id)
 					f := testhelpers.InitializeSettingsFlowViaBrowser(t, browserClient, spa, publicTS)
 					values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
 
@@ -419,11 +423,14 @@ func TestCompleteSettings(t *testing.T) {
 
 					if spa {
 						assert.Contains(t, res.Request.URL.String(), publicTS.URL+settings.RouteSubmitFlow)
+						assert.EqualValues(t, flow.ContinueWithActionRedirectBrowserToString, gjson.Get(actual, "continue_with.0.action").String(), "%s", actual)
+						assert.Contains(t, gjson.Get(actual, "continue_with.0.redirect_browser_to").String(), uiTS.URL, "%s", actual)
 					} else {
 						assert.Contains(t, res.Request.URL.String(), uiTS.URL)
+						assert.Empty(t, gjson.Get(actual, "continue_with").Array(), "%s", actual)
 					}
 
-					assert.EqualValues(t, settings.StateSuccess, json.RawMessage(gjson.Get(actual, "state").String()))
+					assert.EqualValues(t, flow.StateSuccess, json.RawMessage(gjson.Get(actual, "state").String()))
 					checkIdentity(t, id, f)
 					testhelpers.EnsureAAL(t, browserClient, publicTS, "aal2", string(identity.CredentialsTypeLookup))
 				}
@@ -459,24 +466,24 @@ func TestCompleteSettings(t *testing.T) {
 			},
 		} {
 			t.Run("credentials="+tc.d, func(t *testing.T) {
-				var payloadConfirm = func(v url.Values) {
+				payloadConfirm := func(v url.Values) {
 					v.Del(node.LookupRegenerate)
 					v.Del(node.LookupReveal)
 					v.Set(node.LookupDisable, "true")
 				}
 
-				checkIdentity := func(t *testing.T, id *identity.Identity, f *kratos.SelfServiceSettingsFlow) {
+				checkIdentity := func(t *testing.T, id *identity.Identity, f *kratos.SettingsFlow) {
 					_, _, err := reg.PrivilegedIdentityPool().FindByCredentialsIdentifier(context.Background(), identity.CredentialsTypeLookup, id.ID.String())
 					require.ErrorIs(t, err, sqlcon.ErrNoRows)
 
 					actualFlow, err := reg.SettingsFlowPersister().GetSettingsFlow(context.Background(), uuid.FromStringOrNil(f.Id))
 					require.NoError(t, err)
-					assert.Equal(t, "{}", gjson.GetBytes(actualFlow.InternalContext, flow.PrefixInternalContextKey(identity.CredentialsTypeLookup, lookup.InternalContextKeyRegenerated)).Raw)
+					assert.Empty(t, gjson.GetBytes(actualFlow.InternalContext, flow.PrefixInternalContextKey(identity.CredentialsTypeLookup, lookup.InternalContextKeyRegenerated)).Raw)
 				}
 
 				t.Run("type=api", func(t *testing.T) {
 					id, _ := createIdentity(t, reg)
-					apiClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, reg, id)
+					apiClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id)
 					f := testhelpers.InitializeSettingsFlowViaAPI(t, apiClient, publicTS)
 					values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
 
@@ -485,7 +492,7 @@ func TestCompleteSettings(t *testing.T) {
 					assert.Equal(t, http.StatusOK, res.StatusCode)
 
 					assert.Contains(t, res.Request.URL.String(), publicTS.URL+settings.RouteSubmitFlow)
-					assert.EqualValues(t, settings.StateSuccess, json.RawMessage(gjson.Get(actual, "state").String()))
+					assert.EqualValues(t, flow.StateSuccess, json.RawMessage(gjson.Get(actual, "state").String()))
 
 					checkIdentity(t, id, f)
 					testhelpers.EnsureAAL(t, apiClient, publicTS, "aal1")
@@ -494,7 +501,7 @@ func TestCompleteSettings(t *testing.T) {
 				runBrowser := func(t *testing.T, spa bool) {
 					id, _ := createIdentity(t, reg)
 
-					browserClient := testhelpers.NewHTTPClientWithIdentitySessionCookie(t, reg, id)
+					browserClient := testhelpers.NewHTTPClientWithIdentitySessionCookie(t, ctx, reg, id)
 					f := testhelpers.InitializeSettingsFlowViaBrowser(t, browserClient, spa, publicTS)
 					values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
 
@@ -504,11 +511,14 @@ func TestCompleteSettings(t *testing.T) {
 
 					if spa {
 						assert.Contains(t, res.Request.URL.String(), publicTS.URL+settings.RouteSubmitFlow)
+						assert.EqualValues(t, flow.ContinueWithActionRedirectBrowserToString, gjson.Get(actual, "continue_with.0.action").String(), "%s", actual)
+						assert.Contains(t, gjson.Get(actual, "continue_with.0.redirect_browser_to").String(), uiTS.URL, "%s", actual)
 					} else {
 						assert.Contains(t, res.Request.URL.String(), uiTS.URL)
+						assert.Empty(t, gjson.Get(actual, "continue_with").Array(), "%s", actual)
 					}
 
-					assert.EqualValues(t, settings.StateSuccess, json.RawMessage(gjson.Get(actual, "state").String()))
+					assert.EqualValues(t, flow.StateSuccess, json.RawMessage(gjson.Get(actual, "state").String()))
 					checkIdentity(t, id, f)
 					testhelpers.EnsureAAL(t, browserClient, publicTS, "aal1")
 				}

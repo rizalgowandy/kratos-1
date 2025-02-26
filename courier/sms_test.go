@@ -1,17 +1,19 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package courier_test
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/gofrs/uuid"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,10 +21,11 @@ import (
 	"github.com/ory/kratos/courier/template/sms"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/internal"
-	"github.com/ory/x/resilience"
 )
 
 func TestQueueSMS(t *testing.T) {
+	ctx := context.Background()
+
 	expectedSender := "Kratos Test"
 	expectedSMS := []*sms.TestStubModel{
 		{
@@ -43,7 +46,7 @@ func TestQueueSMS(t *testing.T) {
 			Body string
 		}
 
-		rb, err := ioutil.ReadAll(r.Body)
+		rb, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 
 		var body sendSMSRequestBody
@@ -60,6 +63,7 @@ func TestQueueSMS(t *testing.T) {
 			Body: body.Body,
 		})
 	}))
+	t.Cleanup(srv.Close)
 
 	requestConfig := fmt.Sprintf(`{
 		"url": "%s",
@@ -75,15 +79,18 @@ func TestQueueSMS(t *testing.T) {
 	}`, srv.URL)
 
 	conf, reg := internal.NewFastRegistryWithMocks(t)
-	conf.MustSet(config.ViperKeyCourierSMSRequestConfig, requestConfig)
-	conf.MustSet(config.ViperKeyCourierSMSFrom, expectedSender)
-	conf.MustSet(config.ViperKeyCourierSMSEnabled, true)
-	conf.MustSet(config.ViperKeyCourierSMTPURL, "http://foo.url")
+	conf.MustSet(ctx, config.ViperKeyCourierChannels, fmt.Sprintf(`[
+		{
+			"id": "sms",
+			"type": "http",
+			"request_config": %s
+		}
+	]`, requestConfig))
+	conf.MustSet(ctx, config.ViperKeyCourierSMTPURL, "http://foo.url")
 	reg.Logger().Level = logrus.TraceLevel
 
-	ctx := context.Background()
-
-	c := reg.Courier(ctx)
+	c, err := reg.Courier(ctx)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer t.Cleanup(cancel)
@@ -94,16 +101,11 @@ func TestQueueSMS(t *testing.T) {
 		require.NotEqual(t, uuid.Nil, id)
 	}
 
-	go func() {
-		require.NoError(t, c.Work(ctx))
-	}()
+	require.NoError(t, c.DispatchQueue(ctx))
 
-	require.NoError(t, resilience.Retry(reg.Logger(), time.Millisecond*250, time.Second*10, func() error {
-		if len(actual) == len(expectedSMS) {
-			return nil
-		}
-		return errors.New("capacity not reached")
-	}))
+	require.Eventually(t, func() bool {
+		return len(actual) == len(expectedSMS)
+	}, 10*time.Second, 250*time.Millisecond)
 
 	for i, message := range actual {
 		expected := expectedSMS[i]
@@ -111,28 +113,32 @@ func TestQueueSMS(t *testing.T) {
 		assert.Equal(t, expected.To, message.To)
 		assert.Equal(t, fmt.Sprintf("stub sms body %s\n", expected.Body), message.Body)
 	}
-
-	srv.Close()
 }
 
 func TestDisallowedInternalNetwork(t *testing.T) {
-	conf, reg := internal.NewFastRegistryWithMocks(t)
-	conf.MustSet(config.ViperKeyCourierSMSRequestConfig, fmt.Sprintf(`{
-		"url": "http://127.0.0.1/",
-		"method": "GET",
-		"body": "file://./stub/request.config.twilio.jsonnet"
-	}`))
-	conf.MustSet(config.ViperKeyCourierSMSEnabled, true)
-	conf.MustSet(config.ViperKeyCourierSMTPURL, "http://foo.url")
-	conf.MustSet(config.ViperKeyClientHTTPNoPrivateIPRanges, true)
-	reg.Logger().Level = logrus.TraceLevel
-
 	ctx := context.Background()
-	c := reg.Courier(ctx)
+
+	conf, reg := internal.NewFastRegistryWithMocks(t)
+	conf.MustSet(ctx, config.ViperKeyCourierChannels, `[
+		{
+			"id": "sms",
+			"type": "http",
+			"request_config": {
+				"url": "http://127.0.0.1/",
+				"method": "GET",
+				"body": "file://./stub/request.config.twilio.jsonnet"
+			}
+		}
+	]`)
+	conf.MustSet(ctx, config.ViperKeyCourierSMTPURL, "http://foo.url")
+	conf.MustSet(ctx, config.ViperKeyClientHTTPNoPrivateIPRanges, true)
+
+	c, err := reg.Courier(ctx)
+	require.NoError(t, err)
 	c.(interface {
 		FailOnDispatchError()
 	}).FailOnDispatchError()
-	_, err := c.QueueSMS(ctx, sms.NewTestStub(reg, &sms.TestStubModel{
+	_, err = c.QueueSMS(ctx, sms.NewTestStub(reg, &sms.TestStubModel{
 		To:   "+12065550101",
 		Body: "test-sms-body-1",
 	}))
@@ -140,5 +146,5 @@ func TestDisallowedInternalNetwork(t *testing.T) {
 
 	err = c.DispatchQueue(ctx)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "ip 127.0.0.1 is in the 127.0.0.0/8 range")
+	assert.Contains(t, err.Error(), "is not a permitted destination")
 }

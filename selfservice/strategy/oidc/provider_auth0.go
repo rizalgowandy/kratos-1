@@ -1,18 +1,22 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/url"
 	"path"
 	"time"
 
+	"github.com/ory/x/httpx"
+	"github.com/ory/x/stringsx"
+
 	"github.com/tidwall/sjson"
 
 	"github.com/hashicorp/go-retryablehttp"
-
-	"github.com/ory/x/httpx"
 
 	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
@@ -25,10 +29,12 @@ type ProviderAuth0 struct {
 	*ProviderGenericOIDC
 }
 
+var _ OAuth2Provider = (*ProviderAuth0)(nil)
+
 func NewProviderAuth0(
 	config *Configuration,
-	reg dependencies,
-) *ProviderAuth0 {
+	reg Dependencies,
+) Provider {
 	return &ProviderAuth0{
 		ProviderGenericOIDC: &ProviderGenericOIDC{
 			config: config,
@@ -57,7 +63,7 @@ func (g *ProviderAuth0) oauth2(ctx context.Context) (*oauth2.Config, error) {
 			TokenURL: tokenUrl.String(),
 		},
 		Scopes:      g.config.Scope,
-		RedirectURL: g.config.Redir(g.reg.Config(ctx).OIDCRedirectURIBase()),
+		RedirectURL: g.config.Redir(g.reg.Config().OIDCRedirectURIBase(ctx)),
 	}
 
 	return c, nil
@@ -73,18 +79,18 @@ func (g *ProviderAuth0) Claims(ctx context.Context, exchange *oauth2.Token, quer
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 
-	client := g.reg.HTTPClient(ctx, httpx.ResilientClientWithClient(o.Client(ctx, exchange)))
 	u, err := url.Parse(g.config.IssuerURL)
 	if err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 	u.Path = path.Join(u.Path, "/userinfo")
-	req, err := retryablehttp.NewRequest("GET", u.String(), nil)
+
+	ctx, client := httpx.SetOAuth2(ctx, g.reg.HTTPClient(ctx), o, exchange)
+	req, err := retryablehttp.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	if err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 
-	req.Header.Add("Authorization", "Bearer: "+exchange.AccessToken)
 	req.Header.Add("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
@@ -93,8 +99,12 @@ func (g *ProviderAuth0) Claims(ctx context.Context, exchange *oauth2.Token, quer
 	}
 	defer resp.Body.Close()
 
+	if err := logUpstreamError(g.reg.Logger(), resp); err != nil {
+		return nil, err
+	}
+
 	// Once auth0 fixes this bug, all this workaround can be removed.
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
@@ -110,6 +120,7 @@ func (g *ProviderAuth0) Claims(ctx context.Context, exchange *oauth2.Token, quer
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 
+	claims.Issuer = stringsx.Coalesce(claims.Issuer, g.config.IssuerURL)
 	return &claims, nil
 }
 

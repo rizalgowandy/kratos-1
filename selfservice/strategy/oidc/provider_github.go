@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
@@ -11,6 +14,7 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/github"
 
+	"github.com/ory/x/httpx"
 	"github.com/ory/x/stringslice"
 	"github.com/ory/x/stringsx"
 
@@ -19,15 +23,17 @@ import (
 	"github.com/ory/herodot"
 )
 
+var _ OAuth2Provider = (*ProviderGitHub)(nil)
+
 type ProviderGitHub struct {
 	config *Configuration
-	reg    dependencies
+	reg    Dependencies
 }
 
 func NewProviderGitHub(
 	config *Configuration,
-	reg dependencies,
-) *ProviderGitHub {
+	reg Dependencies,
+) Provider {
 	return &ProviderGitHub{
 		config: config,
 		reg:    reg,
@@ -44,7 +50,7 @@ func (g *ProviderGitHub) oauth2(ctx context.Context) *oauth2.Config {
 		ClientSecret: g.config.ClientSecret,
 		Endpoint:     github.Endpoint,
 		Scopes:       g.config.Scope,
-		RedirectURL:  g.config.Redir(g.reg.Config(ctx).OIDCRedirectURIBase()),
+		RedirectURL:  g.config.Redir(g.reg.Config().OIDCRedirectURIBase(ctx)),
 	}
 }
 
@@ -64,7 +70,8 @@ func (g *ProviderGitHub) Claims(ctx context.Context, exchange *oauth2.Token, que
 		}
 	}
 
-	gh := ghapi.NewClient(g.oauth2(ctx).Client(ctx, exchange))
+	ctx, client := httpx.SetOAuth2(ctx, g.reg.HTTPClient(ctx), g.oauth2(ctx), exchange)
+	gh := ghapi.NewClient(client.HTTPClient)
 
 	user, _, err := gh.Users.Get(ctx, "")
 	if err != nil {

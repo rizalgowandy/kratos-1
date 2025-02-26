@@ -1,17 +1,22 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package password
 
 import (
 	"bufio"
 	"context"
+	"crypto/sha1" //#nosec G505 -- sha1 is used for k-anonymity
 	stderrs "errors"
-
-	/* #nosec G505 sha1 is used for k-anonymity */
-	"crypto/sha1"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/ory/kratos/text"
 
 	"github.com/arbovm/levenshtein"
 	"github.com/dgraph-io/ristretto"
@@ -21,6 +26,7 @@ import (
 	"github.com/ory/herodot"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/x/httpx"
+	"github.com/ory/x/otelx"
 )
 
 const hashCacheItemTTL = time.Hour
@@ -42,7 +48,6 @@ var (
 	_                       Validator = new(DefaultPasswordValidator)
 	ErrNetworkFailure                 = stderrs.New("unable to check if password has been leaked because an unexpected network error occurred")
 	ErrUnexpectedStatusCode           = stderrs.New("unexpected status code")
-	ErrTooManyBreaches                = stderrs.New("the password has been found in data breaches and must no longer be used")
 )
 
 // DefaultPasswordValidator implements Validator. It is based on best
@@ -57,7 +62,7 @@ var (
 type DefaultPasswordValidator struct {
 	reg    validatorDependencies
 	Client *retryablehttp.Client
-	hashes *ristretto.Cache
+	hashes *ristretto.Cache[string, int64]
 
 	minIdentifierPasswordDist            int
 	maxIdentifierPasswordSubstrThreshold float32
@@ -68,7 +73,7 @@ type validatorDependencies interface {
 }
 
 func NewDefaultPasswordValidatorStrategy(reg validatorDependencies) (*DefaultPasswordValidator, error) {
-	cache, err := ristretto.NewCache(&ristretto.Config{
+	cache, err := ristretto.NewCache(&ristretto.Config[string, int64]{
 		NumCounters:        10 * 10000,
 		MaxCost:            60 * 10000, // BCrypt hash size is 60 bytes
 		BufferItems:        64,
@@ -79,7 +84,12 @@ func NewDefaultPasswordValidatorStrategy(reg validatorDependencies) (*DefaultPas
 		return nil, errors.Wrap(err, "error while setting up validator cache")
 	}
 	return &DefaultPasswordValidator{
-		Client:                    httpx.NewResilientClient(httpx.ResilientClientWithConnectionTimeout(time.Second)),
+		Client: httpx.NewResilientClient(
+			httpx.ResilientClientWithConnectionTimeout(time.Second),
+			// Tracing still works correctly even though we pass a no-op tracer
+			// here, because the otelhttp package will preferentially use the
+			// tracer from the incoming request context over this one.
+			httpx.ResilientClientWithTracer(noop.NewTracerProvider().Tracer("github.com/ory/kratos/selfservice/strategy/password"))),
 		reg:                       reg,
 		hashes:                    cache,
 		minIdentifierPasswordDist: 5, maxIdentifierPasswordSubstrThreshold: 0.5}, nil
@@ -111,10 +121,14 @@ func lcsLength(a, b string) int {
 	return greatestLength
 }
 
-func (s *DefaultPasswordValidator) fetch(hpw []byte, apiDNSName string) (int64, error) {
+func (s *DefaultPasswordValidator) fetch(ctx context.Context, hpw []byte, apiDNSName string) (int64, error) {
 	prefix := fmt.Sprintf("%X", hpw)[0:5]
 	loc := fmt.Sprintf("https://%s/range/%s", apiDNSName, prefix)
-	res, err := s.Client.Get(loc)
+	req, err := retryablehttp.NewRequestWithContext(ctx, "GET", loc, nil)
+	if err != nil {
+		return 0, err
+	}
+	res, err := s.Client.Do(req)
 	if err != nil {
 		return 0, errors.Wrapf(ErrNetworkFailure, "%s", err)
 	}
@@ -137,7 +151,7 @@ func (s *DefaultPasswordValidator) fetch(hpw []byte, apiDNSName string) (int64, 
 		// See https://github.com/ory/kratos/issues/2145
 		count := int64(1)
 		if len(result) == 2 {
-			count, err = strconv.ParseInt(result[1], 10, 64)
+			count, err = strconv.ParseInt(strings.ReplaceAll(result[1], ",", ""), 10, 64)
 			if err != nil {
 				return 0, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Expected password hash to contain a count formatted as int but got: %s", result[1]))
 			}
@@ -158,10 +172,18 @@ func (s *DefaultPasswordValidator) fetch(hpw []byte, apiDNSName string) (int64, 
 }
 
 func (s *DefaultPasswordValidator) Validate(ctx context.Context, identifier, password string) error {
-	passwordPolicyConfig := s.reg.Config(ctx).PasswordPolicyConfig()
+	return otelx.WithSpan(ctx, "password.DefaultPasswordValidator.Validate", func(ctx context.Context) error {
+		return s.validate(ctx, identifier, password)
+	})
+}
 
+func (s *DefaultPasswordValidator) validate(ctx context.Context, identifier, password string) error {
+	passwordPolicyConfig := s.reg.Config().PasswordPolicyConfig(ctx)
+
+	//nolint:gosec // disable G115
 	if len(password) < int(passwordPolicyConfig.MinPasswordLength) {
-		return errors.Errorf("password length must be at least %d characters but only got %d", passwordPolicyConfig.MinPasswordLength, len(password))
+		//nolint:gosec // disable G115
+		return text.NewErrorValidationPasswordMinLength(int(passwordPolicyConfig.MinPasswordLength), len(password))
 	}
 
 	if passwordPolicyConfig.IdentifierSimilarityCheckEnabled && len(identifier) > 0 {
@@ -169,7 +191,7 @@ func (s *DefaultPasswordValidator) Validate(ctx context.Context, identifier, pas
 		dist := levenshtein.Distance(compIdentifier, compPassword)
 		lcs := float32(lcsLength(compIdentifier, compPassword)) / float32(len(compPassword))
 		if dist < s.minIdentifierPasswordDist || lcs > s.maxIdentifierPasswordSubstrThreshold {
-			return errors.Errorf("the password is too similar to the user identifier")
+			return text.NewErrorValidationPasswordIdentifierTooSimilar()
 		}
 	}
 
@@ -177,7 +199,7 @@ func (s *DefaultPasswordValidator) Validate(ctx context.Context, identifier, pas
 		return nil
 	}
 
-	/* #nosec G401 sha1 is used for k-anonymity */
+	//#nosec G401 -- sha1 is used for k-anonymity
 	h := sha1.New()
 	if _, err := h.Write([]byte(password)); err != nil {
 		return err
@@ -187,7 +209,7 @@ func (s *DefaultPasswordValidator) Validate(ctx context.Context, identifier, pas
 	c, ok := s.hashes.Get(b20(hpw))
 	if !ok {
 		var err error
-		c, err = s.fetch(hpw, passwordPolicyConfig.HaveIBeenPwnedHost)
+		c, err = s.fetch(ctx, hpw, passwordPolicyConfig.HaveIBeenPwnedHost)
 		if (errors.Is(err, ErrNetworkFailure) || errors.Is(err, ErrUnexpectedStatusCode)) && passwordPolicyConfig.IgnoreNetworkErrors {
 			return nil
 		} else if err != nil {
@@ -195,9 +217,9 @@ func (s *DefaultPasswordValidator) Validate(ctx context.Context, identifier, pas
 		}
 	}
 
-	v, ok := c.(int64)
-	if ok && v > int64(s.reg.Config(ctx).PasswordPolicyConfig().MaxBreaches) {
-		return errors.WithStack(ErrTooManyBreaches)
+	//nolint:gosec // disable G115
+	if c > int64(s.reg.Config().PasswordPolicyConfig(ctx).MaxBreaches) {
+		return text.NewErrorValidationPasswordTooManyBreaches(c)
 	}
 
 	return nil

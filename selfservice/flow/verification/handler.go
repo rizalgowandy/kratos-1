@@ -1,9 +1,14 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package verification
 
 import (
 	"net/http"
 	"time"
 
+	"github.com/ory/kratos/hydra"
+	"github.com/ory/kratos/session"
 	"github.com/ory/nosurf"
 
 	"github.com/ory/kratos/schema"
@@ -41,14 +46,19 @@ type (
 		identity.ManagementProvider
 		identity.PrivilegedPoolProvider
 		config.Provider
+		hydra.Provider
+		session.PersistenceProvider
+		session.ManagementProvider
 
 		x.CSRFTokenGeneratorProvider
 		x.WriterProvider
 		x.CSRFProvider
+		x.LoggingProvider
 
 		FlowPersistenceProvider
 		ErrorHandlerProvider
 		StrategyProvider
+		HookExecutorProvider
 	}
 	Handler struct {
 		d handlerDependencies
@@ -63,12 +73,12 @@ func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 	h.d.CSRFHandler().IgnorePath(RouteInitAPIFlow)
 	h.d.CSRFHandler().IgnorePath(RouteSubmitFlow)
 
-	public.GET(RouteInitBrowserFlow, h.initBrowserFlow)
-	public.GET(RouteInitAPIFlow, h.initAPIFlow)
-	public.GET(RouteGetFlow, h.fetch)
+	public.GET(RouteInitBrowserFlow, h.createBrowserVerificationFlow)
+	public.GET(RouteInitAPIFlow, h.createNativeVerificationFlow)
+	public.GET(RouteGetFlow, h.getVerificationFlow)
 
-	public.POST(RouteSubmitFlow, h.submitFlow)
-	public.GET(RouteSubmitFlow, h.submitFlow)
+	public.POST(RouteSubmitFlow, h.updateVerificationFlow)
+	public.GET(RouteSubmitFlow, h.updateVerificationFlow)
 }
 
 func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
@@ -80,9 +90,56 @@ func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
 	admin.GET(RouteSubmitFlow, x.RedirectToPublicRoute(h.d))
 }
 
-// swagger:route GET /self-service/verification/api v0alpha2 initializeSelfServiceVerificationFlowWithoutBrowser
+type FlowOption func(f *Flow)
+
+func WithFlowReturnTo(returnTo string) FlowOption {
+	return func(f *Flow) {
+		f.ReturnTo = returnTo
+	}
+}
+
+func (h *Handler) NewVerificationFlow(w http.ResponseWriter, r *http.Request, ft flow.Type, opts ...FlowOption) (*Flow, error) {
+	strategy, err := h.d.GetActiveVerificationStrategy(r.Context())
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := NewFlow(h.d.Config(), h.d.Config().SelfServiceFlowVerificationRequestLifespan(r.Context()), h.d.GenerateCSRFToken(r), r, strategy, ft)
+	if err != nil {
+		return nil, err
+	}
+	for _, o := range opts {
+		o(f)
+	}
+
+	if err := h.d.VerificationExecutor().PreVerificationHook(w, r, f); err != nil {
+		return nil, err
+	}
+
+	if err := h.d.VerificationFlowPersister().CreateVerificationFlow(r.Context(), f); err != nil {
+		return nil, err
+	}
+
+	return f, nil
+}
+
+// Create Verification Flow Parameters for Native Apps
 //
-// Initialize Verification Flow for APIs, Services, Apps, ...
+// swagger:parameters createNativeVerificationFlow
+//
+//nolint:deadcode,unused
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
+type createNativeVerificationFlow struct {
+	// A URL contained in the return_to key of the verification flow.
+	// This piece of data has no effect on the actual logic of the flow and is purely informational.
+	//
+	// in: query
+	ReturnTo string `json:"return_to"`
+}
+
+// swagger:route GET /self-service/verification/api frontend createNativeVerificationFlow
+//
+// # Create Verification Flow for Native Apps
 //
 // This endpoint initiates a verification flow for API clients such as mobile devices, smart TVs, and so on.
 //
@@ -94,27 +151,22 @@ func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
 //
 // This endpoint MUST ONLY be used in scenarios such as native mobile apps (React Native, Objective C, Swift, Java, ...).
 //
-// More information can be found at [Ory Kratos Email and Phone Verification Documentation](https://www.ory.sh/docs/kratos/self-service/flows/verify-email-account-activation).
+// More information can be found at [Ory Email and Phone Verification Documentation](https://www.ory.sh/docs/kratos/self-service/flows/verify-email-account-activation).
 //
-//     Schemes: http, https
+//	Schemes: http, https
 //
-//     Responses:
-//       200: selfServiceVerificationFlow
-//       500: jsonError
-//       400: jsonError
-func (h *Handler) initAPIFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	if !h.d.Config(r.Context()).SelfServiceFlowVerificationEnabled() {
+//	Responses:
+//	  200: verificationFlow
+//	  400: errorGeneric
+//	  default: errorGeneric
+func (h *Handler) createNativeVerificationFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	if !h.d.Config().SelfServiceFlowVerificationEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Verification is not allowed because it was disabled.")))
 		return
 	}
 
-	req, err := NewFlow(h.d.Config(r.Context()), h.d.Config(r.Context()).SelfServiceFlowVerificationRequestLifespan(), h.d.GenerateCSRFToken(r), r, h.d.VerificationStrategies(r.Context()), flow.TypeAPI)
+	req, err := h.NewVerificationFlow(w, r, flow.TypeAPI)
 	if err != nil {
-		h.d.Writer().WriteError(w, r, err)
-		return
-	}
-
-	if err := h.d.VerificationFlowPersister().CreateVerificationFlow(r.Context(), req); err != nil {
 		h.d.Writer().WriteError(w, r, err)
 		return
 	}
@@ -122,18 +174,22 @@ func (h *Handler) initAPIFlow(w http.ResponseWriter, r *http.Request, _ httprout
 	h.d.Writer().Write(w, r, req)
 }
 
-// nolint:deadcode,unused
-// swagger:parameters initializeSelfServiceVerificationFlowForBrowsers
-type initializeSelfServiceVerificationFlowForBrowsers struct {
+// Create Browser Verification Flow Parameters
+//
+// swagger:parameters createBrowserVerificationFlow
+//
+//nolint:deadcode,unused
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
+type createBrowserVerificationFlow struct {
 	// The URL to return the browser to after the flow was completed.
 	//
 	// in: query
 	ReturnTo string `json:"return_to"`
 }
 
-// swagger:route GET /self-service/verification/browser v0alpha2 initializeSelfServiceVerificationFlowForBrowsers
+// swagger:route GET /self-service/verification/browser frontend createBrowserVerificationFlow
 //
-// Initialize Verification Flow for Browser Clients
+// # Create Verification Flow for Browser Clients
 //
 // This endpoint initializes a browser-based account verification flow. Once initialized, the browser will be redirected to
 // `selfservice.flows.verification.ui_url` with the flow ID set as the query parameter `?flow=`.
@@ -142,38 +198,37 @@ type initializeSelfServiceVerificationFlowForBrowsers struct {
 //
 // This endpoint is NOT INTENDED for API clients and only works with browsers (Chrome, Firefox, ...).
 //
-// More information can be found at [Ory Kratos Email and Phone Verification Documentation](https://www.ory.sh/docs/kratos/selfservice/flows/verify-email-account-activation).
+// More information can be found at [Ory Kratos Email and Phone Verification Documentation](https://www.ory.sh/docs/kratos/self-service/flows/verify-email-account-activation).
 //
-//     Schemes: http, https
+//	Schemes: http, https
 //
-//     Responses:
-//       200: selfServiceVerificationFlow
-//       303: emptyResponse
-//       500: jsonError
-func (h *Handler) initBrowserFlow(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	if !h.d.Config(r.Context()).SelfServiceFlowVerificationEnabled() {
+//	Responses:
+//	  200: verificationFlow
+//	  303: emptyResponse
+//	  default: errorGeneric
+func (h *Handler) createBrowserVerificationFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	if !h.d.Config().SelfServiceFlowVerificationEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Verification is not allowed because it was disabled.")))
 		return
 	}
 
-	req, err := NewFlow(h.d.Config(r.Context()), h.d.Config(r.Context()).SelfServiceFlowVerificationRequestLifespan(), h.d.GenerateCSRFToken(r), r, h.d.VerificationStrategies(r.Context()), flow.TypeBrowser)
+	req, err := h.NewVerificationFlow(w, r, flow.TypeBrowser)
 	if err != nil {
-		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, err)
+		h.d.Writer().WriteError(w, r, err)
 		return
 	}
 
-	if err := h.d.VerificationFlowPersister().CreateVerificationFlow(r.Context(), req); err != nil {
-		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, err)
-		return
-	}
-
-	redirTo := req.AppendTo(h.d.Config(r.Context()).SelfServiceFlowVerificationUI()).String()
+	redirTo := req.AppendTo(h.d.Config().SelfServiceFlowVerificationUI(r.Context())).String()
 	x.AcceptToRedirectOrJSON(w, r, h.d.Writer(), req, redirTo)
 }
 
-// swagger:parameters getSelfServiceVerificationFlow
-// nolint:deadcode,unused
-type getSelfServiceVerificationFlow struct {
+// Get Verification Flow Parameters
+//
+// swagger:parameters getVerificationFlow
+//
+//nolint:deadcode,unused
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
+type getVerificationFlow struct {
 	// The Flow ID
 	//
 	// The value for this parameter comes from `request` URL Query parameter sent to your
@@ -193,9 +248,9 @@ type getSelfServiceVerificationFlow struct {
 	Cookie string `json:"cookie"`
 }
 
-// swagger:route GET /self-service/verification/flows v0alpha2 getSelfServiceVerificationFlow
+// swagger:route GET /self-service/verification/flows frontend getVerificationFlow
 //
-// Get Verification Flow
+// # Get Verification Flow
 //
 // This endpoint returns a verification flow's context with, for example, error details and other information.
 //
@@ -208,25 +263,26 @@ type getSelfServiceVerificationFlow struct {
 //	```js
 //	// pseudo-code example
 //	router.get('/recovery', async function (req, res) {
-//	  const flow = await client.getSelfServiceVerificationFlow(req.header('cookie'), req.query['flow'])
+//	  const flow = await client.getVerificationFlow(req.header('cookie'), req.query['flow'])
 //
-//    res.render('verification', flow)
+//	  res.render('verification', flow)
 //	})
+//	```
 //
-// More information can be found at [Ory Kratos Email and Phone Verification Documentation](https://www.ory.sh/docs/kratos/selfservice/flows/verify-email-account-activation).
+// More information can be found at [Ory Kratos Email and Phone Verification Documentation](https://www.ory.sh/docs/kratos/self-service/flows/verify-email-account-activation).
 //
-//     Produces:
-//     - application/json
+//	Produces:
+//	- application/json
 //
-//     Schemes: http, https
+//	Schemes: http, https
 //
-//     Responses:
-//       200: selfServiceVerificationFlow
-//       403: jsonError
-//       404: jsonError
-//       500: jsonError
-func (h *Handler) fetch(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	if !h.d.Config(r.Context()).SelfServiceFlowVerificationEnabled() {
+//	Responses:
+//	  200: verificationFlow
+//	  403: errorGeneric
+//	  404: errorGeneric
+//	  default: errorGeneric
+func (h *Handler) getVerificationFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	if !h.d.Config().SelfServiceFlowVerificationEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Verification is not allowed because it was disabled.")))
 		return
 	}
@@ -248,7 +304,7 @@ func (h *Handler) fetch(w http.ResponseWriter, r *http.Request, _ httprouter.Par
 
 	if req.ExpiresAt.Before(time.Now().UTC()) {
 		if req.Type == flow.TypeBrowser {
-			redirectURL := flow.GetFlowExpiredRedirectURL(h.d.Config(r.Context()), RouteInitBrowserFlow, req.ReturnTo)
+			redirectURL := flow.GetFlowExpiredRedirectURL(r.Context(), h.d.Config(), RouteInitBrowserFlow, req.ReturnTo)
 
 			h.d.Writer().WriteError(w, r, errors.WithStack(x.ErrGone.
 				WithReason("The verification flow has expired. Redirect the user to the verification flow init endpoint to initialize a new verification flow.").
@@ -258,16 +314,20 @@ func (h *Handler) fetch(w http.ResponseWriter, r *http.Request, _ httprouter.Par
 		}
 		h.d.Writer().WriteError(w, r, errors.WithStack(x.ErrGone.
 			WithReason("The verification flow has expired. Call the verification flow init API endpoint to initialize a new verification flow.").
-			WithDetail("api", urlx.AppendPaths(h.d.Config(r.Context()).SelfPublicURL(), RouteInitAPIFlow).String())))
+			WithDetail("api", urlx.AppendPaths(h.d.Config().SelfPublicURL(r.Context()), RouteInitAPIFlow).String())))
 		return
 	}
 
 	h.d.Writer().Write(w, r, req)
 }
 
-// nolint:deadcode,unused
-// swagger:parameters submitSelfServiceVerificationFlow
-type submitSelfServiceVerificationFlow struct {
+// Update Verification Flow Parameters
+//
+// swagger:parameters updateVerificationFlow
+//
+//nolint:deadcode,unused
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
+type updateVerificationFlow struct {
 	// The Verification Flow ID
 	//
 	// The value for this parameter comes from `flow` URL Query parameter sent to your
@@ -289,7 +349,7 @@ type submitSelfServiceVerificationFlow struct {
 
 	// in: body
 	// required: true
-	Body submitSelfServiceVerificationFlowBody
+	Body updateVerificationFlowBody
 
 	// HTTP Cookies
 	//
@@ -301,54 +361,59 @@ type submitSelfServiceVerificationFlow struct {
 	Cookies string `json:"Cookie"`
 }
 
-// nolint:deadcode,unused
-// swagger:model submitSelfServiceVerificationFlowBody
-type submitSelfServiceVerificationFlowBody struct{}
-
-// swagger:route POST /self-service/verification v0alpha2 submitSelfServiceVerificationFlow
+// Update Verification Flow Request Body
 //
-// Complete Verification Flow
+// swagger:model updateVerificationFlowBody
+//
+//nolint:deadcode,unused
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
+type updateVerificationFlowBody struct{}
+
+// swagger:route POST /self-service/verification frontend updateVerificationFlow
+//
+// # Complete Verification Flow
 //
 // Use this endpoint to complete a verification flow. This endpoint
 // behaves differently for API and browser flows and has several states:
 //
-// - `choose_method` expects `flow` (in the URL query) and `email` (in the body) to be sent
-//   and works with API- and Browser-initiated flows.
-//	 - For API clients and Browser clients with HTTP Header `Accept: application/json` it either returns a HTTP 200 OK when the form is valid and HTTP 400 OK when the form is invalid
+//   - `choose_method` expects `flow` (in the URL query) and `email` (in the body) to be sent
+//     and works with API- and Browser-initiated flows.
+//   - For API clients and Browser clients with HTTP Header `Accept: application/json` it either returns a HTTP 200 OK when the form is valid and HTTP 400 OK when the form is invalid
 //     and a HTTP 303 See Other redirect with a fresh verification flow if the flow was otherwise invalid (e.g. expired).
-//	 - For Browser clients without HTTP Header `Accept` or with `Accept: text/*` it returns a HTTP 303 See Other redirect to the Verification UI URL with the Verification Flow ID appended.
-// - `sent_email` is the success state after `choose_method` when using the `link` method and allows the user to request another verification email. It
-//   works for both API and Browser-initiated flows and returns the same responses as the flow in `choose_method` state.
-// - `passed_challenge` expects a `token` to be sent in the URL query and given the nature of the flow ("sending a verification link")
-//   does not have any API capabilities. The server responds with a HTTP 303 See Other redirect either to the Settings UI URL
-//   (if the link was valid) and instructs the user to update their password, or a redirect to the Verification UI URL with
-//   a new Verification Flow ID which contains an error message that the verification link was invalid.
+//   - For Browser clients without HTTP Header `Accept` or with `Accept: text/*` it returns a HTTP 303 See Other redirect to the Verification UI URL with the Verification Flow ID appended.
+//   - `sent_email` is the success state after `choose_method` when using the `link` method and allows the user to request another verification email. It
+//     works for both API and Browser-initiated flows and returns the same responses as the flow in `choose_method` state.
+//   - `passed_challenge` expects a `token` to be sent in the URL query and given the nature of the flow ("sending a verification link")
+//     does not have any API capabilities. The server responds with a HTTP 303 See Other redirect either to the Settings UI URL
+//     (if the link was valid) and instructs the user to update their password, or a redirect to the Verification UI URL with
+//     a new Verification Flow ID which contains an error message that the verification link was invalid.
 //
-// More information can be found at [Ory Kratos Email and Phone Verification Documentation](https://www.ory.sh/docs/kratos/selfservice/flows/verify-email-account-activation).
+// More information can be found at [Ory Kratos Email and Phone Verification Documentation](https://www.ory.sh/docs/kratos/self-service/flows/verify-email-account-activation).
 //
-//     Consumes:
-//     - application/json
-//     - application/x-www-form-urlencoded
+//	Consumes:
+//	- application/json
+//	- application/x-www-form-urlencoded
 //
-//     Produces:
-//     - application/json
+//	Produces:
+//	- application/json
 //
-//     Schemes: http, https
+//	Schemes: http, https
 //
-//     Responses:
-//       200: selfServiceVerificationFlow
-//       303: emptyResponse
-//       400: selfServiceVerificationFlow
-//       410: jsonError
-//       500: jsonError
-func (h *Handler) submitFlow(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+//	Responses:
+//	  200: verificationFlow
+//	  303: emptyResponse
+//	  400: verificationFlow
+//	  410: errorGeneric
+//	  default: errorGeneric
+func (h *Handler) updateVerificationFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	rid, err := flow.GetFlowID(r)
 	if err != nil {
 		h.d.VerificationFlowErrorHandler().WriteFlowError(w, r, nil, node.DefaultGroup, err)
 		return
 	}
 
-	f, err := h.d.VerificationFlowPersister().GetVerificationFlow(r.Context(), rid)
+	ctx := r.Context()
+	f, err := h.d.VerificationFlowPersister().GetVerificationFlow(ctx, rid)
 	if errors.Is(err, sqlcon.ErrNoRows) {
 		h.d.VerificationFlowErrorHandler().WriteFlowError(w, r, nil, node.DefaultGroup, errors.WithStack(herodot.ErrNotFound.WithReasonf("The verification request could not be found. Please restart the flow.")))
 		return
@@ -365,18 +430,23 @@ func (h *Handler) submitFlow(w http.ResponseWriter, r *http.Request, ps httprout
 	var g node.UiNodeGroup
 	var found bool
 	for _, ss := range h.d.AllVerificationStrategies() {
+		// If an active strategy is set, but it does not match the current strategy, that strategy is not responsible anyways.
+		if f.Active.String() != "" && f.Active.String() != ss.VerificationStrategyID() {
+			continue
+		}
+
 		err := ss.Verify(w, r, f)
 		if errors.Is(err, flow.ErrStrategyNotResponsible) {
 			continue
 		} else if errors.Is(err, flow.ErrCompletedByStrategy) {
 			return
 		} else if err != nil {
-			h.d.VerificationFlowErrorHandler().WriteFlowError(w, r, f, ss.VerificationNodeGroup(), err)
+			h.d.VerificationFlowErrorHandler().WriteFlowError(w, r, f, ss.NodeGroup(), err)
 			return
 		}
 
 		found = true
-		g = ss.VerificationNodeGroup()
+		g = ss.NodeGroup()
 		break
 	}
 
@@ -385,12 +455,73 @@ func (h *Handler) submitFlow(w http.ResponseWriter, r *http.Request, ps httprout
 		return
 	}
 
-	if f.Type == flow.TypeBrowser && !x.IsJSONRequest(r) {
-		http.Redirect(w, r, f.AppendTo(h.d.Config(r.Context()).SelfServiceFlowVerificationUI()).String(), http.StatusSeeOther)
-		return
+	// API flows can receive requests from the browser, if the link strategy is used.
+	// However, x.IsBrowserRequest only checks for form submissions, not JSON requests made from a browser context
+	if x.IsBrowserRequest(r) || (f.Type == flow.TypeBrowser && x.IsJSONRequest(r)) {
+		// Special case: If we ended up here through a OAuth2 login challenge, we need to accept the login request
+		// and redirect back to the OAuth2 provider.
+		if flow.HasReachedState(flow.StatePassedChallenge, f.State) && f.OAuth2LoginChallenge.String() != "" {
+			if !f.IdentityID.Valid || !f.SessionID.Valid {
+				h.d.VerificationFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup,
+					herodot.ErrBadRequest.WithReasonf("No session was found for this flow. Please retry the authentication."))
+				return
+			}
+
+			callbackURL, err := h.d.Hydra().AcceptLoginRequest(ctx,
+				hydra.AcceptLoginRequestParams{
+					LoginChallenge:        string(f.OAuth2LoginChallenge),
+					IdentityID:            f.IdentityID.UUID.String(),
+					SessionID:             f.SessionID.UUID.String(),
+					AuthenticationMethods: f.AMR,
+				})
+			if err != nil {
+				h.d.VerificationFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, err)
+				return
+			}
+
+			sess, err := h.d.SessionPersister().GetSession(ctx, f.SessionID.UUID, session.ExpandDefault)
+			if err != nil {
+				h.d.VerificationFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, err)
+				return
+			}
+
+			err = h.d.SessionManager().IssueCookie(ctx, w, r, sess)
+			if err != nil {
+				h.d.VerificationFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, err)
+				return
+			}
+
+			if x.IsJSONRequest(r) {
+				// This intentionally works differently than the "form browser" flow,
+				// as it _does_ show the `verification success` UI, but the "Continue"
+				// button contains the link to the OAuth2 provider with the `login_verifier`.
+				continueNode := f.UI.Nodes.Find("continue")
+				if continueNode != nil {
+					if attr, ok := continueNode.Attributes.(*node.AnchorAttributes); ok {
+						attr.HREF = callbackURL
+						if err := h.d.VerificationFlowPersister().UpdateVerificationFlow(ctx, f); err != nil {
+							h.d.VerificationFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, err)
+							return
+						}
+
+						h.d.Writer().Write(w, r, f)
+						return
+					}
+				}
+
+				// The flow does not have the `continue` node, which is an unknown state.
+				// This should never happen.
+			} else {
+				http.Redirect(w, r, callbackURL, http.StatusSeeOther)
+				return
+			}
+		} else if x.IsBrowserRequest(r) {
+			http.Redirect(w, r, f.AppendTo(h.d.Config().SelfServiceFlowVerificationUI(ctx)).String(), http.StatusSeeOther)
+			return
+		}
 	}
 
-	updatedFlow, err := h.d.VerificationFlowPersister().GetVerificationFlow(r.Context(), f.ID)
+	updatedFlow, err := h.d.VerificationFlowPersister().GetVerificationFlow(ctx, f.ID)
 	if err != nil {
 		h.d.VerificationFlowErrorHandler().WriteFlowError(w, r, f, g, err)
 		return

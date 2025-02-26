@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package x_test
 
 import (
@@ -7,6 +10,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/ory/x/configx"
 
 	"github.com/julienschmidt/httprouter"
 	"github.com/stretchr/testify/assert"
@@ -18,28 +23,28 @@ import (
 )
 
 func TestRedirectToPublicAdminRoute(t *testing.T) {
-	conf, reg := internal.NewFastRegistryWithMocks(t)
 	pub := x.NewRouterPublic()
 	adm := x.NewRouterAdmin()
 	adminTS := httptest.NewServer(adm)
 	pubTS := httptest.NewServer(pub)
 	t.Cleanup(pubTS.Close)
 	t.Cleanup(adminTS.Close)
-
-	conf.MustSet(config.ViperKeyAdminBaseURL, adminTS.URL)
-	conf.MustSet(config.ViperKeyPublicBaseURL, pubTS.URL)
+	_, reg := internal.NewFastRegistryWithMocks(t, configx.WithValues(map[string]any{
+		config.ViperKeyAdminBaseURL:  adminTS.URL,
+		config.ViperKeyPublicBaseURL: pubTS.URL,
+	}))
 
 	pub.POST("/privileged", x.RedirectToAdminRoute(reg))
 	pub.POST("/admin/privileged", x.RedirectToAdminRoute(reg))
 	adm.POST("/privileged", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 		body, _ := io.ReadAll(r.Body)
-		w.Write(body)
+		_, _ = w.Write(body)
 	})
 
 	adm.POST("/read", x.RedirectToPublicRoute(reg))
 	pub.POST("/read", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 		body, _ := io.ReadAll(r.Body)
-		w.Write(body)
+		_, _ = w.Write(body)
 	})
 
 	for k, tc := range []struct {
